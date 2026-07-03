@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, Trash2, RefreshCw } from "lucide-react";
+import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { Provider } from "./providers";
 import { t, dir as uiDir, useLang } from "./i18n";
 
@@ -34,6 +35,33 @@ export default function ProvidersModal({
 
   function remove(i: number) {
     setLocal((cur) => cur.filter((_, j) => j !== i));
+  }
+
+  const [fetching, setFetching] = useState<number | null>(null);
+  const [fetchErr, setFetchErr] = useState<number | null>(null);
+
+  // Pull the provider's real model list from its /models endpoint, using the
+  // key stored in the form (the key never leaves the machine).
+  async function fetchModels(i: number) {
+    const p = local[i];
+    setFetching(i);
+    setFetchErr(null);
+    try {
+      const res = await tauriFetch(`${p.baseURL.replace(/\/+$/, "")}/models`, {
+        headers: { Authorization: `Bearer ${p.apiKey}` },
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const j: any = await res.json();
+      const ids = (Array.isArray(j?.data) ? j.data : [])
+        .map((m: any) => m?.id)
+        .filter((x: any) => typeof x === "string");
+      if (!ids.length) throw new Error("empty");
+      update(i, { models: ids });
+    } catch {
+      setFetchErr(i);
+    } finally {
+      setFetching(null);
+    }
   }
 
   return (
@@ -100,7 +128,13 @@ export default function ProvidersModal({
                 }
               />
             </label>
-            <div style={{ gridColumn: "1 / -1", display: "flex", justifyContent: "flex-end" }}>
+            <div style={{ gridColumn: "1 / -1", display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8 }}>
+              {fetchErr === i && (
+                <span style={{ fontSize: 11, color: "var(--red)", flex: 1 }}>{t("fetchModelsFailed")}</span>
+              )}
+              <button className="ghost" disabled={fetching === i || !p.apiKey} onClick={() => fetchModels(i)}>
+                <RefreshCw size={13} className={fetching === i ? "typing" : undefined} /> {t("fetchModels")}
+              </button>
               {local.length > 1 && (
                 <button className="ghost" style={{ color: "var(--red)" }} onClick={() => remove(i)}>
                   <Trash2 size={13} /> {t("del")}

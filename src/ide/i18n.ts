@@ -409,6 +409,22 @@ const S = {
   addProvider: { fa: "افزودن سرویس", en: "Add provider", ru: "Добавить провайдера", ja: "プロバイダを追加", zh: "添加服务商", tr: "Sağlayıcı ekle" },
   newProvider: { fa: "سرویس جدید", en: "New provider", ru: "Новый провайдер", ja: "新しいプロバイダ", zh: "新服务商", tr: "Yeni sağlayıcı" },
   del: { fa: "حذف", en: "Delete", ru: "Удалить", ja: "削除", zh: "删除", tr: "Sil" },
+  fetchModels: {
+    fa: "دریافت مدل‌ها از سرویس",
+    en: "Fetch models from API",
+    ru: "Получить модели из API",
+    ja: "APIからモデル取得",
+    zh: "从 API 获取模型",
+    tr: "Modelleri API'den al",
+  },
+  fetchModelsFailed: {
+    fa: "دریافت نشد — کلید یا Base URL را چک کن (برای پلن Coding زد.ای‌آی: /api/coding/paas/v4)",
+    en: "Fetch failed — check the key or Base URL (Z.AI Coding plan uses /api/coding/paas/v4)",
+    ru: "Не удалось — проверьте ключ или Base URL (Coding-план Z.AI: /api/coding/paas/v4)",
+    ja: "取得失敗 — キーとBase URLを確認（Z.AI Codingプランは /api/coding/paas/v4）",
+    zh: "获取失败 — 检查密钥或 Base URL（Z.AI Coding 套餐用 /api/coding/paas/v4）",
+    tr: "Alınamadı — anahtarı veya Base URL'yi kontrol et (Z.AI Coding planı: /api/coding/paas/v4)",
+  },
 } satisfies Record<string, Entry>;
 
 export type StrKey = keyof typeof S;
