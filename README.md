@@ -47,7 +47,7 @@ On first launch: click the key icon to add your API key(s), open a project folde
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE)
 
 ---
 
@@ -95,6 +95,6 @@ npm run tauri build      # خروجی .app و .dmg
 
 ## لایسنس
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE)
 
 </div>
