@@ -11,16 +11,19 @@ import {
   KeyRound,
   FolderOpen,
   Command,
+  Globe,
 } from "lucide-react";
 import "./ide/monacoSetup";
 import FileTree from "./components/FileTree";
 import EditorArea from "./ide/EditorArea";
 import TerminalPanel from "./ide/TerminalPanel";
+import type { BrowserTab } from "./ide/BrowserTabView";
 import ChatPanel from "./ide/ChatPanel";
 import UsagePanel from "./ide/UsagePanel";
 import CommandPalette from "./ide/CommandPalette";
 import SearchPanel from "./ide/SearchPanel";
 import { EditorTab, baseName } from "./ide/types";
+import { kindForPath, isBinaryKind } from "./ide/fileKind";
 import { getWindows, formatCountdown } from "./ide/limits";
 import { Provider, loadProviders, saveProviders, loadActiveProviderId, saveActiveProviderId, defaultProviders } from "./ide/providers";
 import ProvidersModal from "./ide/ProvidersModal";
@@ -54,6 +57,8 @@ export default function App() {
   const [sideView, setSideView] = useState<"files" | "search" | null>("files");
   const [showTerminal, setShowTerminal] = useState(true);
   const [showChat, setShowChat] = useState(true);
+  const [browserTabs, setBrowserTabs] = useState<BrowserTab[]>([]);
+  const [activeBrowserId, setActiveBrowserId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
   const [paletteMode, setPaletteMode] = useState<"files" | "actions" | null>(null);
   const [totalTokens, setTotalTokens] = useState(0);
@@ -78,6 +83,12 @@ export default function App() {
   useEffect(() => saveActiveProviderId(activeProviderId), [activeProviderId]);
   useEffect(() => localStorage.setItem("sakana_model", model), [model]);
   useEffect(() => localStorage.setItem("vibe_workspace", workspace), [workspace]);
+  // Grants the asset:// protocol read access to this workspace so binary
+  // previews (image/audio/video/PDF) can stream files via convertFileSrc
+  // instead of round-tripping them through IPC as base64.
+  useEffect(() => {
+    if (workspace) invoke("register_asset_scope", { workspace }).catch(() => {});
+  }, [workspace]);
   useEffect(() => localStorage.setItem(RECENTS_KEY, JSON.stringify(recents)), [recents]);
 
   const activeProvider =
@@ -114,9 +125,17 @@ export default function App() {
 
   const openFile = useCallback(
     async (relPath: string, line?: number) => {
+      setActiveBrowserId(null);
       const existing = tabsRef.current.findIndex((t) => t.path === relPath);
       if (existing >= 0) {
         setActiveIndex(existing);
+      } else if (isBinaryKind(kindForPath(relPath))) {
+        // Image/audio/video/PDF previews stream their own bytes via the
+        // asset:// protocol; read_file (UTF-8 text) would just error on them.
+        setTabs((cur) => {
+          setActiveIndex(cur.length);
+          return [...cur, { path: relPath, content: "", original: "" }];
+        });
       } else {
         try {
           const content = await invoke<string>("read_file", { workspace, path: relPath });
@@ -133,6 +152,40 @@ export default function App() {
     },
     [workspace, toast]
   );
+
+  function selectFileTab(i: number) {
+    setActiveBrowserId(null);
+    setActiveIndex(i);
+  }
+
+  function newBrowserTab() {
+    const id = crypto.randomUUID();
+    setBrowserTabs((cur) => [...cur, { id, url: "https://example.com", title: "" }]);
+    setActiveBrowserId(id);
+  }
+
+  function closeBrowserTab(id: string) {
+    setBrowserTabs((cur) => {
+      const idx = cur.findIndex((b) => b.id === id);
+      const next = cur.filter((b) => b.id !== id);
+      setActiveBrowserId((cur) => {
+        if (cur !== id) return cur;
+        if (next.length === 0) return null;
+        return next[Math.max(0, idx - 1)].id;
+      });
+      return next;
+    });
+  }
+
+  function navigateBrowserTab(id: string, url: string) {
+    setBrowserTabs((cur) => cur.map((b) => (b.id === id ? { ...b, url } : b)));
+    invoke("browser_navigate", { tabId: id, url }).catch(() => {});
+  }
+
+  function focusBrowser() {
+    if (browserTabs.length === 0) newBrowserTab();
+    else setActiveBrowserId((cur) => cur ?? browserTabs[browserTabs.length - 1].id);
+  }
 
   function changeTab(path: string, content: string) {
     setTabs((cur) => cur.map((t) => (t.path === path ? { ...t, content } : t)));
@@ -284,6 +337,13 @@ export default function App() {
           >
             <MessageSquare size={19} />
           </button>
+          <button
+            className={`act-btn ${activeBrowserId !== null ? "on" : ""}`}
+            onClick={focusBrowser}
+            title={t("browserTitle")}
+          >
+            <Globe size={19} />
+          </button>
           <div className="spacer" />
           <button className="act-btn" onClick={() => setShowUsage(true)} title={t("usageLimit")}>
             <BarChart3 size={19} />
@@ -333,13 +393,20 @@ export default function App() {
               <PanelGroup direction="vertical">
                 <Panel key="editor" order={1} defaultSize={showTerminal ? 68 : 100} minSize={20}>
                   <EditorArea
+                    workspace={workspace}
                     tabs={tabs}
                     activeIndex={activeIndex}
-                    onSelect={setActiveIndex}
+                    onSelect={selectFileTab}
                     onClose={closeTab}
                     onChange={changeTab}
                     onSave={saveTab}
                     goto={goto}
+                    browserTabs={browserTabs}
+                    activeBrowserId={activeBrowserId}
+                    onSelectBrowser={setActiveBrowserId}
+                    onCloseBrowser={closeBrowserTab}
+                    onNavigateBrowser={navigateBrowserTab}
+                    onNewBrowserTab={newBrowserTab}
                   />
                 </Panel>
                 {showTerminal && <PanelResizeHandle key="term-h" className="resize-v" />}
@@ -363,6 +430,7 @@ export default function App() {
               <Panel key="chat" order={3} defaultSize={28} minSize={18}>
                 <ChatPanel
                   provider={activeProvider}
+                  providers={providers}
                   model={model}
                   workspace={workspace}
                   onFileChanged={onFileChanged}

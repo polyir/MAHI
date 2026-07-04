@@ -1,4 +1,6 @@
+mod browser;
 mod checkpoint;
+mod media;
 mod pty;
 
 use regex::Regex;
@@ -88,6 +90,19 @@ pub(crate) fn resolve(workspace: &str, rel: &str) -> Result<PathBuf, String> {
 fn read_file(workspace: String, path: String) -> Result<String, String> {
     let p = resolve(&workspace, &path)?;
     fs::read_to_string(p).map_err(|e| e.to_string())
+}
+
+/// Grant the asset:// protocol read access to a workspace directory, so the
+/// frontend can preview binary files (images/audio/video/PDF) via
+/// `convertFileSrc` — which streams straight from disk instead of round-
+/// tripping the whole file through the IPC channel as base64 (which chokes
+/// on anything more than a few MB).
+#[tauri::command]
+fn register_asset_scope(app: tauri::AppHandle, workspace: String) -> Result<(), String> {
+    use tauri::Manager;
+    app.asset_protocol_scope()
+        .allow_directory(&workspace, true)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -348,7 +363,14 @@ pub fn run() {
         .manage(checkpoint::CheckpointManager::default())
         .invoke_handler(tauri::generate_handler![
             read_file,
+            register_asset_scope,
+            browser::browser_open,
+            browser::browser_reposition,
+            browser::browser_navigate,
+            browser::browser_hide,
+            browser::browser_close,
             write_file,
+            media::write_file_binary,
             edit_file,
             delete_file,
             move_file,

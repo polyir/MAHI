@@ -1,29 +1,9 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Msg } from "../agent";
 import ToolCallView from "./ToolCallView";
+import CodeBlock from "./CodeBlock";
 import { t } from "../ide/i18n";
-
-function CodeBlock({ className, children }: { className?: string; children: React.ReactNode }) {
-  const match = /language-(\w+)/.exec(className || "");
-  const code = String(children).replace(/\n$/, "");
-  if (!match) {
-    return <code className="inline-code">{code}</code>;
-  }
-  return (
-    <div dir="ltr">
-      <SyntaxHighlighter
-        language={match[1]}
-        style={oneDark}
-        customStyle={{ margin: "6px 0", borderRadius: 8, fontSize: 12.5 }}
-      >
-        {code}
-      </SyntaxHighlighter>
-    </div>
-  );
-}
 
 export default function Message({ msg, workspace }: { msg: Msg; workspace: string }) {
   if (msg.role === "tool") {

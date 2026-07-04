@@ -27,6 +27,7 @@ const MAX_ATTACH_CHARS = 8000;
 
 export default function ChatPanel({
   provider,
+  providers,
   model,
   workspace,
   onFileChanged,
@@ -35,6 +36,7 @@ export default function ChatPanel({
   toast,
 }: {
   provider: Provider;
+  providers: Provider[];
   model: string;
   workspace: string;
   onFileChanged: (relPath: string) => void;
@@ -270,6 +272,8 @@ export default function ChatPanel({
         },
         onUsage: (u) => addUsage(u),
         requestApproval,
+        chatProvider: provider,
+        allProviders: providers,
       });
     } catch (e: any) {
       if (e?.name === "AbortError" || controller.signal.aborted) {

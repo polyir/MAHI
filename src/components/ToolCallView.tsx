@@ -10,9 +10,14 @@ import {
   Search,
   TerminalSquare,
   MoveRight,
+  Image,
+  Music,
+  Video,
 } from "lucide-react";
 import { Msg } from "../agent";
 import DiffView from "./DiffView";
+import ImagePreview from "../ide/preview/ImagePreview";
+import MediaPreview from "../ide/preview/MediaPreview";
 
 const TOOL_ICONS: Record<string, React.ReactNode> = {
   read_file: <FileText size={13} />,
@@ -24,6 +29,9 @@ const TOOL_ICONS: Record<string, React.ReactNode> = {
   glob_files: <Search size={13} />,
   search_files: <Search size={13} />,
   run_command: <TerminalSquare size={13} />,
+  generate_image: <Image size={13} />,
+  generate_audio: <Music size={13} />,
+  generate_video: <Video size={13} />,
 };
 
 function summarize(name: string, args: any): string {
@@ -43,12 +51,16 @@ function summarize(name: string, args: any): string {
       return `search "${args?.query ?? ""}"`;
     case "run_command":
       return `$ ${args?.cmd ?? ""}`;
+    case "generate_image":
+    case "generate_audio":
+    case "generate_video":
+      return `${name} ${args?.path ?? ""}`;
     default:
       return name;
   }
 }
 
-export default function ToolCallView({ msg }: { msg: Msg; workspace: string }) {
+export default function ToolCallView({ msg, workspace }: { msg: Msg; workspace: string }) {
   const [open, setOpen] = useState(false);
   const name = msg.toolName ?? "tool";
   const args = msg.toolArgs ?? {};
@@ -105,8 +117,13 @@ export default function ToolCallView({ msg }: { msg: Msg; workspace: string }) {
               {parsedRunResult.stderr}
             </pre>
           )}
+          {name === "generate_image" && !isError && <ImagePreview workspace={workspace} path={args.path} />}
+          {name === "generate_audio" && !isError && (
+            <MediaPreview workspace={workspace} path={args.path} kind="audio" />
+          )}
           {(["list_dir", "glob_files", "search_files", "delete_file", "move_file"].includes(name) ||
             (name === "run_command" && !parsedRunResult) ||
+            name === "generate_video" ||
             isError) && (
             <pre style={{ fontSize: 11.5, margin: 0, maxHeight: 240, overflow: "auto" }}>{msg.content}</pre>
           )}

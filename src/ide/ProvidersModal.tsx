@@ -1,8 +1,21 @@
 import { useState } from "react";
 import { Plus, Trash2, RefreshCw } from "lucide-react";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
-import { Provider } from "./providers";
-import { t, dir as uiDir, useLang } from "./i18n";
+import {
+  Provider,
+  ProviderRole,
+  PROVIDER_ROLES,
+  isRoleRoutingEnabled,
+  setRoleRoutingEnabled,
+} from "./providers";
+import { t, dir as uiDir, useLang, StrKey } from "./i18n";
+
+const ROLE_LABEL_KEY: Record<ProviderRole, StrKey> = {
+  chat: "roleChat",
+  image: "roleImage",
+  audio: "roleAudio",
+  video: "roleVideo",
+};
 
 export default function ProvidersModal({
   providers,
@@ -15,9 +28,17 @@ export default function ProvidersModal({
 }) {
   useLang();
   const [local, setLocal] = useState<Provider[]>(() => providers.map((p) => ({ ...p })));
+  const [routingEnabled, setRoutingEnabled] = useState(isRoleRoutingEnabled());
 
   function update(i: number, patch: Partial<Provider>) {
     setLocal((cur) => cur.map((p, j) => (j === i ? { ...p, ...patch } : p)));
+  }
+
+  function toggleRole(i: number, role: ProviderRole) {
+    const cur = local[i].roles ?? ["chat"];
+    const has = cur.includes(role);
+    const next = has ? cur.filter((r) => r !== role) : [...cur, role];
+    update(i, { roles: next });
   }
 
   function addProvider() {
@@ -77,6 +98,32 @@ export default function ProvidersModal({
           {t("providersNote")}
         </div>
 
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 12.5,
+            marginBottom: 16,
+            padding: 10,
+            border: "1px solid var(--border-soft)",
+            borderRadius: 10,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={routingEnabled}
+            onChange={(e) => {
+              setRoutingEnabled(e.target.checked);
+              setRoleRoutingEnabled(e.target.checked);
+            }}
+          />
+          <div>
+            <div>{t("roleRoutingLabel")}</div>
+            <div style={{ fontSize: 11, opacity: 0.65, marginTop: 2 }}>{t("roleRoutingHelp")}</div>
+          </div>
+        </label>
+
         {local.map((p, i) => (
           <div
             key={p.id}
@@ -128,6 +175,65 @@ export default function ProvidersModal({
                 }
               />
             </label>
+
+            <div style={{ gridColumn: "1 / -1", display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {PROVIDER_ROLES.map((role) => {
+                const checked = (p.roles ?? ["chat"]).includes(role);
+                return (
+                  <label
+                    key={role}
+                    className={`role-pill ${checked ? "on" : ""}`}
+                    style={{ cursor: "pointer", userSelect: "none" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggleRole(i, role)}
+                      style={{ marginInlineEnd: 4 }}
+                    />
+                    {t(ROLE_LABEL_KEY[role])}
+                  </label>
+                );
+              })}
+            </div>
+
+            {(p.roles ?? []).includes("image") && (
+              <label style={{ fontSize: 11, opacity: 0.7 }}>
+                {t("roleImage")} model
+                <input
+                  dir="ltr"
+                  style={{ width: "100%", marginTop: 3 }}
+                  placeholder={p.models[0] ?? ""}
+                  value={p.imageModel ?? ""}
+                  onChange={(e) => update(i, { imageModel: e.target.value })}
+                />
+              </label>
+            )}
+            {(p.roles ?? []).includes("audio") && (
+              <label style={{ fontSize: 11, opacity: 0.7 }}>
+                {t("roleAudio")} model
+                <input
+                  dir="ltr"
+                  style={{ width: "100%", marginTop: 3 }}
+                  placeholder={p.models[0] ?? ""}
+                  value={p.audioModel ?? ""}
+                  onChange={(e) => update(i, { audioModel: e.target.value })}
+                />
+              </label>
+            )}
+            {(p.roles ?? []).includes("video") && (
+              <label style={{ fontSize: 11, opacity: 0.7 }}>
+                {t("roleVideo")} model
+                <input
+                  dir="ltr"
+                  style={{ width: "100%", marginTop: 3 }}
+                  placeholder={p.models[0] ?? ""}
+                  value={p.videoModel ?? ""}
+                  onChange={(e) => update(i, { videoModel: e.target.value })}
+                />
+              </label>
+            )}
+
             <div style={{ gridColumn: "1 / -1", display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8 }}>
               {fetchErr === i && (
                 <span style={{ fontSize: 11, color: "var(--red)", flex: 1 }}>{t("fetchModelsFailed")}</span>

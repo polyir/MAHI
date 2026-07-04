@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { reportRateLimitReset } from "./ide/limits";
 import { t } from "./ide/i18n";
+import { Provider, ProviderRole, findProviderForRole } from "./ide/providers";
 
 export type ToolCall = {
   id: string;
@@ -49,11 +50,26 @@ export const SENSITIVE_TOOLS = new Set([
   "delete_file",
   "move_file",
   "run_command",
+  "generate_image",
+  "generate_audio",
+  "generate_video",
 ]);
 
 // File-mutating tools snapshot the previous state into the turn's checkpoint
-// so the user can revert the whole turn.
+// so the user can revert the whole turn. Media-generation tools are
+// deliberately NOT included: checkpoint_record reads the "before" content as
+// UTF-8 text, so on a binary file it silently records "did not exist" and a
+// revert would DELETE the file instead of restoring its bytes. Until
+// checkpoint.rs gets a binary-safe snapshot, generated media is excluded
+// from turn-revert rather than risk destroying it.
 const CHECKPOINTED_TOOLS = new Set(["write_file", "edit_file", "delete_file", "move_file"]);
+
+// Tool name -> which provider role should serve it, when role routing is on.
+const MEDIA_TOOLS: Record<string, ProviderRole> = {
+  generate_image: "image",
+  generate_audio: "audio",
+  generate_video: "video",
+};
 
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
@@ -184,6 +200,56 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "generate_image",
+      description:
+        "Generate an image from a text prompt and save it into the workspace. Uses whichever provider is configured with the 'image' role (Settings → Providers), or the current chat provider if role routing is off or no image provider is configured.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          path: { type: "string", description: "where to save the image, relative to the workspace root, e.g. 'assets/hero.png'" },
+          size: { type: "string", description: "e.g. '1024x1024'" },
+        },
+        required: ["prompt", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "generate_audio",
+      description:
+        "Generate speech audio from text and save it into the workspace. Uses whichever provider is configured with the 'audio' role, or falls back to the current chat provider.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          path: { type: "string" },
+          voice: { type: "string" },
+        },
+        required: ["text", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "generate_video",
+      description:
+        "Generate a short video from a text prompt and save it into the workspace. Uses whichever provider is configured with the 'video' role. Most OpenAI-compatible providers do not support this yet; expect a clear error unless the routed provider's endpoint exists.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          path: { type: "string" },
+        },
+        required: ["prompt", "path"],
+      },
+    },
+  },
 ];
 
 // Tool results feed straight into conversation history, which gets resent in
@@ -293,6 +359,48 @@ export function makeClient(apiKey: string, baseURL = "https://api.sakana.ai/v1")
   });
 }
 
+/// Media-generation tools run against whichever provider owns that role
+/// (see findProviderForRole), which may differ from the chat provider —
+/// so they build their own short-lived client rather than reusing runTool's.
+async function runMediaTool(provider: Provider, workspace: string, name: string, args: any): Promise<string> {
+  try {
+    const client = makeClient(provider.apiKey, provider.baseURL);
+    if (name === "generate_image") {
+      const model = provider.imageModel || provider.models[0];
+      const resp = await client.images.generate({
+        model,
+        prompt: args.prompt,
+        size: args.size,
+        response_format: "b64_json",
+      } as any);
+      const b64 = (resp.data?.[0] as any)?.b64_json;
+      if (!b64) return "error: provider did not return image data (it may not support image generation)";
+      await invoke("write_file_binary", { workspace, path: args.path, base64Content: b64 });
+      return `ok: image saved to ${args.path} (via provider "${provider.name}")`;
+    }
+    if (name === "generate_audio") {
+      const model = provider.audioModel || provider.models[0];
+      const resp = await client.audio.speech.create({
+        model,
+        voice: (args.voice || "alloy") as any,
+        input: args.text,
+      });
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
+      const b64 = btoa(binary);
+      await invoke("write_file_binary", { workspace, path: args.path, base64Content: b64 });
+      return `ok: audio saved to ${args.path} (via provider "${provider.name}")`;
+    }
+    if (name === "generate_video") {
+      return "error: video generation is not supported by the OpenAI-compatible SDK surface — no standard endpoint exists yet for this provider.";
+    }
+    return `unknown media tool: ${name}`;
+  } catch (e) {
+    return `error: ${String(e)}`;
+  }
+}
+
 export type AgentOptions = {
   reasoningEffort?: ReasoningEffort;
   temperature?: number;
@@ -308,6 +416,12 @@ export type AgentOptions = {
   onHeaders?: (headers: Record<string, string>) => void;
   onNotice?: (text: string) => void;
   requestApproval: (toolName: string, args: any) => Promise<boolean>;
+  // Needed to route generate_image/generate_audio/generate_video to
+  // whichever provider owns that role, which may differ from the provider
+  // driving this chat turn. chatProvider is also the fallback when role
+  // routing is off or no provider claims the role.
+  chatProvider?: Provider;
+  allProviders?: Provider[];
 };
 
 function isRetryable(e: any): boolean {
@@ -642,7 +756,18 @@ export async function agentTurn(
       }
 
       let result: string;
-      if (SENSITIVE_TOOLS.has(call.function.name)) {
+      if (call.function.name in MEDIA_TOOLS) {
+        const approved = await opts.requestApproval(call.function.name, args);
+        if (!approved) {
+          result = "Rejected by user. Do not retry this exact action without asking.";
+        } else if (!opts.chatProvider) {
+          result = "error: no provider available to route this media tool";
+        } else {
+          const role = MEDIA_TOOLS[call.function.name];
+          const roleProvider = findProviderForRole(opts.allProviders ?? [], role, opts.chatProvider);
+          result = await runMediaTool(roleProvider, workspace, call.function.name, args);
+        }
+      } else if (SENSITIVE_TOOLS.has(call.function.name)) {
         const approved = await opts.requestApproval(call.function.name, args);
         result = approved
           ? await runTool(workspace, call.function.name, args, opts.checkpointId)

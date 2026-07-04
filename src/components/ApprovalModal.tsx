@@ -42,6 +42,8 @@ export default function ApprovalModal({
             ? t("approvalDelete")
             : pending.toolName === "move_file"
             ? t("approvalMove")
+            : ["generate_image", "generate_audio", "generate_video"].includes(pending.toolName)
+            ? t("approvalGenerate")
             : t("approvalEdit")}
         </h3>
 
@@ -74,6 +76,12 @@ export default function ApprovalModal({
             <div style={{ fontSize: 13, opacity: 0.8, marginBottom: 4 }}>{pending.args.path}</div>
             <DiffView before={pending.args.old_string ?? ""} after={pending.args.new_string ?? ""} />
           </>
+        )}
+
+        {["generate_image", "generate_audio", "generate_video"].includes(pending.toolName) && (
+          <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>
+            "{pending.args.prompt ?? pending.args.text}" → {pending.args.path}
+          </pre>
         )}
 
         {pending.toolName === "write_file" && (

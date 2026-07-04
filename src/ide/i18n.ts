@@ -90,6 +90,8 @@ const S = {
     tr: "Projede ara",
   },
   terminal: { fa: "ترمینال", en: "Terminal", ru: "Терминал", ja: "ターミナル", zh: "终端", tr: "Terminal" },
+  browserTitle: { fa: "مرورگر", en: "Browser", ru: "Браузер", ja: "ブラウザ", zh: "浏览器", tr: "Tarayıcı" },
+  close: { fa: "بستن", en: "Close", ru: "Закрыть", ja: "閉じる", zh: "关闭", tr: "Kapat" },
   aiChat: { fa: "چت هوش مصنوعی", en: "AI chat", ru: "ИИ-чат", ja: "AIチャット", zh: "AI 聊天", tr: "Yapay zekâ sohbeti" },
   usageLimit: {
     fa: "مصرف و محدودیت",
@@ -154,6 +156,16 @@ const S = {
   // ---- file tree / editor ----
   noFolderSelected: { fa: "پوشه‌ای انتخاب نشده", en: "No folder selected", ru: "Папка не выбрана", ja: "フォルダ未選択", zh: "未选择文件夹", tr: "Klasör seçilmedi" },
   loading: { fa: "در حال بارگذاری…", en: "Loading…", ru: "Загрузка…", ja: "読み込み中…", zh: "加载中…", tr: "Yükleniyor…" },
+  rawView: { fa: "نمای خام", en: "Raw view", ru: "Исходный вид", ja: "生ビュー", zh: "原始视图", tr: "Ham görünüm" },
+  renderedView: { fa: "نمای رندرشده", en: "Rendered view", ru: "Отрендеренный вид", ja: "レンダー表示", zh: "渲染视图", tr: "Görüntülenmiş" },
+  toggleDirection: {
+    fa: "تغییر جهت نوشتار (راست‌به‌چپ/چپ‌به‌راست)",
+    en: "Toggle text direction (RTL/LTR)",
+    ru: "Переключить направление текста (RTL/LTR)",
+    ja: "文字方向を切り替え (RTL/LTR)",
+    zh: "切换文字方向（RTL/LTR）",
+    tr: "Metin yönünü değiştir (RTL/LTR)",
+  },
   editorEmpty: {
     fa: "فایلی از سایدبار باز کن (⌘P) یا از دستیار بخواه کاری انجام بده",
     en: "Open a file from the sidebar (⌘P) or ask the assistant to do something",
@@ -323,6 +335,14 @@ const S = {
   approvalDelete: { fa: "🗑 حذف فایل", en: "🗑 Delete file", ru: "🗑 Удалить файл", ja: "🗑 ファイル削除", zh: "🗑 删除文件", tr: "🗑 Dosyayı sil" },
   approvalMove: { fa: "📦 جابجایی فایل", en: "📦 Move file", ru: "📦 Переместить файл", ja: "📦 ファイル移動", zh: "📦 移动文件", tr: "📦 Dosyayı taşı" },
   approvalEdit: { fa: "✏️ تغییر فایل", en: "✏️ Edit file", ru: "✏️ Изменить файл", ja: "✏️ ファイル編集", zh: "✏️ 修改文件", tr: "✏️ Dosyayı düzenle" },
+  approvalGenerate: {
+    fa: "🎨 تولید رسانه",
+    en: "🎨 Generate media",
+    ru: "🎨 Сгенерировать медиа",
+    ja: "🎨 メディア生成",
+    zh: "🎨 生成媒体",
+    tr: "🎨 Medya üret",
+  },
   loadingCurrent: {
     fa: "در حال بارگذاری محتوای فعلی…",
     en: "Loading current content…",
@@ -417,6 +437,26 @@ const S = {
     zh: "从 API 获取模型",
     tr: "Modelleri API'den al",
   },
+  roleRoutingLabel: {
+    fa: "روتینگ خودکار بر اساس نقش",
+    en: "Automatic role-based routing",
+    ru: "Автомаршрутизация по ролям",
+    ja: "役割ベースの自動ルーティング",
+    zh: "基于角色的自动路由",
+    tr: "Role dayalı otomatik yönlendirme",
+  },
+  roleRoutingHelp: {
+    fa: "وقتی روشن باشه، ابزارهایی مثل تولید عکس/صدا به‌جای provider فعال چت، از providerـی که آن نقش را دارد استفاده می‌کنن.",
+    en: "When on, tools like image/audio generation automatically use whichever provider is assigned that role, instead of the active chat provider.",
+    ru: "Когда включено, инструменты вроде генерации изображений/аудио используют провайдера с этой ролью вместо активного провайдера чата.",
+    ja: "オンにすると、画像/音声生成などのツールはチャットの現在のプロバイダではなく、その役割が割り当てられたプロバイダを自動的に使用します。",
+    zh: "开启后，图像/音频生成等工具会自动使用分配了该角色的服务商，而不是当前聊天服务商。",
+    tr: "Açıkken, görsel/ses üretimi gibi araçlar etkin sohbet sağlayıcısı yerine o role atanmış sağlayıcıyı kullanır.",
+  },
+  roleChat: { fa: "چت", en: "Chat", ru: "Чат", ja: "チャット", zh: "聊天", tr: "Sohbet" },
+  roleImage: { fa: "عکس", en: "Image", ru: "Изображение", ja: "画像", zh: "图像", tr: "Görsel" },
+  roleAudio: { fa: "صدا", en: "Audio", ru: "Аудио", ja: "音声", zh: "音频", tr: "Ses" },
+  roleVideo: { fa: "ویدیو", en: "Video", ru: "Видео", ja: "動画", zh: "视频", tr: "Video" },
   fetchModelsFailed: {
     fa: "دریافت نشد — کلید یا Base URL را چک کن (برای پلن Coding زد.ای‌آی: /api/coding/paas/v4)",
     en: "Fetch failed — check the key or Base URL (Z.AI Coding plan uses /api/coding/paas/v4)",
