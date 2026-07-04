@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Folder, FolderOpen, FileText } from "lucide-react";
+import { Folder, FolderOpen, FileText, Image, Music, Video } from "lucide-react";
 import { t, useLang } from "../ide/i18n";
+import { kindForPath } from "../ide/fileKind";
+
+function FileIcon({ path }: { path: string }) {
+  const kind = kindForPath(path);
+  const style = { color: "var(--text-faint)", flexShrink: 0 } as const;
+  if (kind === "image") return <Image size={14} style={style} />;
+  if (kind === "audio") return <Music size={14} style={style} />;
+  if (kind === "video") return <Video size={14} style={style} />;
+  return <FileText size={14} style={style} />;
+}
 
 type Entry = { name: string; is_dir: boolean };
 
@@ -71,7 +81,7 @@ function Node({
             <Folder size={14} style={{ color: "var(--text-faint)", flexShrink: 0 }} />
           )
         ) : (
-          <FileText size={14} style={{ color: "var(--text-faint)", flexShrink: 0 }} />
+          <FileIcon path={relPath} />
         )}
         <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>{name}</span>
       </div>

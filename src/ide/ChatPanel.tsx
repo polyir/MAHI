@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   Plus,
   History,
@@ -10,8 +11,11 @@ import {
   Undo2,
   Bot,
   RotateCw,
+  Briefcase,
+  FolderPlus,
+  Trash2,
 } from "lucide-react";
-import { agentTurn, makeClient, Msg, Usage, sanitizeEffort, sanitizeHistory, compactHistory } from "../agent";
+import { agentTurn, makeClient, Msg, Usage, sanitizeEffort, sanitizeHistory, compactHistory, BrowserControl } from "../agent";
 import FishLoader from "./FishLoader";
 import { recordUsage } from "./limits";
 import { notifyTaskDone } from "./completion";
@@ -20,6 +24,8 @@ import ApprovalModal, { PendingApproval } from "../components/ApprovalModal";
 import SettingsModal, { SessionSettings } from "../components/SettingsModal";
 import type { Session } from "./sessions";
 import { loadSessions, newSession, SESSIONS_KEY, ACTIVE_KEY } from "./sessions";
+import type { Project } from "./projects";
+import { loadProjects, saveProjects, loadActiveProjectId, saveActiveProjectId, newProject } from "./projects";
 import type { Provider } from "./providers";
 import { t, useLang, dir as uiDir } from "./i18n";
 
@@ -27,25 +33,37 @@ const MAX_ATTACH_CHARS = 8000;
 
 export default function ChatPanel({
   provider,
+  providers,
   model,
   workspace,
   onFileChanged,
   onUsageChange,
   onHeaders,
   toast,
+  browserControl,
 }: {
   provider: Provider;
+  providers: Provider[];
   model: string;
   workspace: string;
   onFileChanged: (relPath: string) => void;
   onUsageChange: (total: number) => void;
   onHeaders: (headers: Record<string, string>) => void;
   toast: (text: string, kind?: "ok" | "err") => void;
+  browserControl: BrowserControl;
 }) {
   useLang();
+  const [projects, setProjects] = useState<Project[]>(loadProjects);
+  const [activeProjectId, setActiveProjectId] = useState<string>(loadActiveProjectId);
+  const activeProject = projects.find((p) => p.id === activeProjectId) ?? projects[0];
+  // The directory this chat's tool calls operate on — independent of
+  // `workspace` (the IDE's own open-folder), which is only used below to
+  // decide whether an agent file-change should also refresh the IDE tree.
+  const projectDir = activeProject?.directory ?? "";
+
   const [sessions, setSessions] = useState<Session[]>(() => {
     const s = loadSessions();
-    return s.length ? s : [newSession()];
+    return s.length ? s : [newSession(loadActiveProjectId())];
   });
   const [activeId, setActiveId] = useState<string>(() => localStorage.getItem(ACTIVE_KEY) ?? "");
   // Draft is persisted per-session so it survives panel remounts and app
@@ -61,12 +79,15 @@ export default function ChatPanel({
     });
   };
   const [busy, setBusy] = useState(false);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const turnStartRef = useRef<number | null>(null);
   const [streamingText, setStreamingText] = useState("");
   const [notice, setNotice] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [pastedImages, setPastedImages] = useState<string[]>([]);
   const [mentionOpen, setMentionOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const [projectFiles, setProjectFiles] = useState<string[]>([]);
@@ -75,10 +96,44 @@ export default function ChatPanel({
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // browser_screenshot results live here, keyed by tool_call_id — NEVER on
+  // the persisted Msg/session (see agent.ts's runBrowserTool comment): a
+  // multi-MB base64 PNG on a stored message would get resent to the API on
+  // every later call and written to localStorage on every session save.
+  // A plain ref (not state) avoids growing this into serialized app state.
+  const screenshotsRef = useRef<Map<string, string>>(new Map());
+  const [, bumpScreenshots] = useReducer((x: number) => x + 1, 0);
+  function onScreenshot(toolCallId: string, base64: string) {
+    screenshotsRef.current.set(toolCallId, base64);
+    bumpScreenshots();
+  }
+  function getScreenshot(toolCallId?: string): string | undefined {
+    return toolCallId ? screenshotsRef.current.get(toolCallId) : undefined;
+  }
 
   useEffect(() => {
     if (!sessions.find((s) => s.id === activeId)) setActiveId(sessions[0].id);
   }, []);
+
+  // Live elapsed-time counter shown next to the "Working…" indicator.
+  useEffect(() => {
+    if (!busy) return;
+    const id = setInterval(() => {
+      if (turnStartRef.current) setElapsedMs(Date.now() - turnStartRef.current);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [busy]);
+
+  function formatK(n: number): string {
+    return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+  }
+
+  function formatElapsed(ms: number): string {
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
 
   // ⌘N: new chat
   useEffect(() => {
@@ -91,26 +146,79 @@ export default function ChatPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
-  useEffect(() => localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions)), [sessions]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+    } catch (e) {
+      // Quota exceeded or similar — without this catch, an uncaught error
+      // here (there's no error boundary anywhere in the app) unmounts the
+      // whole React tree, which looks like the entire window going blank.
+      toast(`${t("saveError")}: ${String(e)}`, "err");
+    }
+  }, [sessions]);
   useEffect(() => localStorage.setItem(ACTIVE_KEY, activeId), [activeId]);
+  useEffect(() => saveProjects(projects), [projects]);
+  useEffect(() => saveActiveProjectId(activeProjectId), [activeProjectId]);
+
+  // Switching the active project should show one of ITS chats — reuse the
+  // most recent one if it has any, otherwise start a fresh chat for it.
+  useEffect(() => {
+    const forThisProject = sessions.filter((s) => s.projectId === activeProjectId);
+    if (forThisProject.some((s) => s.id === activeId)) return;
+    if (forThisProject.length) {
+      setActiveId(forThisProject.slice().sort((a, b) => b.createdAt - a.createdAt)[0].id);
+    } else {
+      const s = newSession(activeProjectId);
+      setSessions((cur) => [s, ...cur]);
+      setActiveId(s.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectId]);
 
   // Restore the per-session draft on mount and whenever the session changes.
   useEffect(() => {
     setInputRaw(localStorage.getItem(`vibe_draft_${activeId}`) ?? "");
+    setLastPromptTokens(0); // context gauge below has no reading for this chat yet
   }, [activeId]);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [sessions, streamingText, activeId]);
 
-  // File list for @-mention (refreshed when workspace changes)
+  // File list for @-mention (refreshed when the active project's directory changes)
   useEffect(() => {
-    if (!workspace) return;
-    invoke<string>("project_tree", { workspace, maxEntries: 3000 })
+    if (!projectDir) return;
+    invoke<string>("project_tree", { workspace: projectDir, maxEntries: 3000 })
       .then((t) => setProjectFiles(t ? t.split("\n").filter(Boolean) : []))
       .catch(() => setProjectFiles([]));
-  }, [workspace]);
+  }, [projectDir]);
 
-  const active = sessions.find((s) => s.id === activeId) ?? sessions[0];
+  const active =
+    sessions.find((s) => s.id === activeId && s.projectId === activeProjectId) ??
+    sessions.find((s) => s.projectId === activeProjectId) ??
+    sessions[0];
+
+  function pickProjectFolder() {
+    open({ directory: true, multiple: false }).then((dir) => {
+      if (typeof dir !== "string") return;
+      const existing = projects.find((p) => p.directory === dir);
+      if (existing) {
+        setActiveProjectId(existing.id);
+        return;
+      }
+      const p = newProject(dir);
+      setProjects((cur) => [...cur, p]);
+      setActiveProjectId(p.id);
+    });
+  }
+
+  function deleteProject(id: string) {
+    if (projects.length <= 1) return;
+    setProjects((cur) => cur.filter((p) => p.id !== id));
+    setSessions((cur) => cur.filter((s) => s.projectId !== id));
+    if (activeProjectId === id) {
+      setActiveProjectId(projects.find((p) => p.id !== id)!.id);
+    }
+  }
 
   useEffect(() => {
     onUsageChange(active?.usage.total_tokens ?? 0);
@@ -122,7 +230,13 @@ export default function ChatPanel({
   function addMessage(m: Msg) {
     setSessions((cur) => cur.map((s) => (s.id === active.id ? { ...s, messages: [...s.messages, m] } : s)));
   }
+  // The last API-reported prompt_tokens is the real, current size of the
+  // conversation as billed by the provider — unlike active.usage.total_tokens
+  // (a running sum across the whole session), this is what the context
+  // window gauge below needs.
+  const [lastPromptTokens, setLastPromptTokens] = useState(0);
   function addUsage(u: Usage) {
+    setLastPromptTokens(u.prompt_tokens);
     // The 5h/weekly window tracker models Sakana's subscription limits.
     if (provider.id === "sakana") recordUsage(u.total_tokens);
     setSessions((cur) =>
@@ -142,7 +256,7 @@ export default function ChatPanel({
     );
   }
   function createChat() {
-    const s = newSession();
+    const s = newSession(activeProjectId);
     setSessions((cur) => [s, ...cur]);
     setActiveId(s.id);
     setShowHistory(false);
@@ -150,22 +264,30 @@ export default function ChatPanel({
   function deleteChat(id: string) {
     setSessions((cur) => {
       const next = cur.filter((s) => s.id !== id);
-      const result = next.length ? next : [newSession()];
-      if (id === activeId) setActiveId(result[0].id);
-      return result;
+      if (id === activeId) {
+        const sameProject = next.filter((s) => s.projectId === activeProjectId);
+        if (sameProject.length) {
+          setActiveId(sameProject.slice().sort((a, b) => b.createdAt - a.createdAt)[0].id);
+        } else {
+          const s = newSession(activeProjectId);
+          setActiveId(s.id);
+          return [s, ...next];
+        }
+      }
+      return next;
     });
   }
 
   function requestApproval(toolName: string, args: any): Promise<boolean> {
     if (active.autoApprove) return Promise.resolve(true);
     return new Promise((resolve) => {
-      setPendingApproval({ toolName, args, workspace, resolve });
+      setPendingApproval({ toolName, args, workspace: projectDir, resolve });
     });
   }
 
   async function revertTo(checkpointId: number) {
     try {
-      const restored = await invoke<string[]>("checkpoint_revert", { workspace, id: checkpointId });
+      const restored = await invoke<string[]>("checkpoint_revert", { workspace: projectDir, id: checkpointId });
       for (const p of restored) onFileChanged(p);
       toast(restored.length ? `${restored.length} ${t("revertedN")}` : t("nothingToRevert"));
     } catch (e) {
@@ -206,6 +328,44 @@ export default function ChatPanel({
     abortRef.current?.abort();
   }
 
+  // Downscales/recompresses a pasted image before it ever touches state:
+  // a raw screen capture can be several MB, and this becomes part of the
+  // conversation (persisted to localStorage, resent to the API) — a capped
+  // JPEG keeps both bounded without visibly hurting the model's ability to
+  // read a screenshot.
+  async function fileToCompressedDataUrl(file: File, maxDim = 1568, quality = 0.72): Promise<string> {
+    const bitmap = await createImageBitmap(file);
+    let { width, height } = bitmap;
+    if (width > maxDim || height > maxDim) {
+      const scale = maxDim / Math.max(width, height);
+      width = Math.round(width * scale);
+      height = Math.round(height * scale);
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("canvas unavailable");
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    return canvas.toDataURL("image/jpeg", quality);
+  }
+
+  async function onPasteInput(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = Array.from(e.clipboardData.items).filter((it) => it.type.startsWith("image/"));
+    if (!items.length) return; // let normal text paste proceed
+    e.preventDefault();
+    for (const item of items) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      try {
+        const dataUrl = await fileToCompressedDataUrl(file);
+        setPastedImages((cur) => [...cur, dataUrl]);
+      } catch {
+        toast(t("pasteImageError"), "err");
+      }
+    }
+  }
+
   // The tree text is resent as part of the system message on every single
   // API call within a turn (these APIs are stateless), so keep it small and
   // reuse one fetch per workspace instead of re-fetching every send.
@@ -213,11 +373,11 @@ export default function ChatPanel({
   async function buildSystemContent(): Promise<string> {
     let systemContent = active.systemPrompt;
     try {
-      if (treeCache.current?.workspace !== workspace) {
-        const tree = await invoke<string>("project_tree", { workspace, maxEntries: 120 });
-        treeCache.current = { workspace, tree };
+      if (treeCache.current?.workspace !== projectDir) {
+        const tree = await invoke<string>("project_tree", { workspace: projectDir, maxEntries: 120 });
+        treeCache.current = { workspace: projectDir, tree };
       }
-      systemContent += `\n\nWorkspace root: ${workspace}\nProject files (partial listing; use glob_files/list_dir for more):\n${treeCache.current.tree}`;
+      systemContent += `\n\nWorkspace root: ${projectDir}\nProject files (partial listing; use glob_files/list_dir for more):\n${treeCache.current.tree}`;
     } catch {
       // proceed without tree
     }
@@ -233,6 +393,8 @@ export default function ChatPanel({
       clientSigRef.current = clientSig;
     }
     setBusy(true);
+    turnStartRef.current = Date.now();
+    setElapsedMs(0);
     setStreamingText("");
     setNotice("");
     const controller = new AbortController();
@@ -241,7 +403,7 @@ export default function ChatPanel({
     let wasManualStop = false;
 
     try {
-      await agentTurn(clientRef.current, model, workspace, history, {
+      await agentTurn(clientRef.current, model, projectDir, history, {
         // reasoning_effort is Sakana-specific; other providers may reject
         // unknown params, so only send it there.
         reasoningEffort: provider.id === "sakana" ? sanitizeEffort(active.reasoningEffort) : undefined,
@@ -260,9 +422,14 @@ export default function ChatPanel({
             m.role === "tool" &&
             ["write_file", "edit_file", "delete_file", "move_file"].includes(m.toolName ?? "")
           ) {
-            if (m.toolArgs?.path) onFileChanged(m.toolArgs.path);
-            if (m.toolArgs?.from) onFileChanged(m.toolArgs.from);
-            if (m.toolArgs?.to) onFileChanged(m.toolArgs.to);
+            // Only refresh the IDE's own file tree/tabs when this chat's
+            // project happens to be the folder currently open in the IDE —
+            // a chat scoped to a different project shouldn't touch it.
+            if (projectDir === workspace) {
+              if (m.toolArgs?.path) onFileChanged(m.toolArgs.path);
+              if (m.toolArgs?.from) onFileChanged(m.toolArgs.from);
+              if (m.toolArgs?.to) onFileChanged(m.toolArgs.to);
+            }
             if (["write_file", "delete_file", "move_file"].includes(m.toolName ?? "")) {
               treeCache.current = null; // structure changed; refetch next turn
             }
@@ -270,6 +437,10 @@ export default function ChatPanel({
         },
         onUsage: (u) => addUsage(u),
         requestApproval,
+        chatProvider: provider,
+        allProviders: providers,
+        browserControl,
+        onScreenshot,
       });
     } catch (e: any) {
       if (e?.name === "AbortError" || controller.signal.aborted) {
@@ -298,8 +469,8 @@ export default function ChatPanel({
       toast(`${t("enterApiKeyFor")} ${provider.name}`, "err");
       return;
     }
-    if (!workspace) {
-      toast(t("openFolderFirst"), "err");
+    if (!projectDir) {
+      toast(t("noProjectHint"), "err");
       return;
     }
 
@@ -307,7 +478,7 @@ export default function ChatPanel({
     let userContent = input;
     for (const path of attachments) {
       try {
-        let content = await invoke<string>("read_file", { workspace, path });
+        let content = await invoke<string>("read_file", { workspace: projectDir, path });
         if (content.length > MAX_ATTACH_CHARS) {
           content = content.slice(0, MAX_ATTACH_CHARS) + "\n… (truncated)";
         }
@@ -325,7 +496,12 @@ export default function ChatPanel({
       checkpointId = undefined;
     }
 
-    const userMsg: Msg = { role: "user", content: userContent, checkpointId };
+    const userMsg: Msg = {
+      role: "user",
+      content: userContent,
+      checkpointId,
+      images: pastedImages.length ? pastedImages : undefined,
+    };
     const isFirst = !active.messages.some((m) => m.role === "user");
     const systemContent = await buildSystemContent();
     // Older turns' tool dumps get compacted before sending — they'd otherwise
@@ -345,6 +521,7 @@ export default function ChatPanel({
     );
     setInput("");
     setAttachments([]);
+    setPastedImages([]);
     await runTurn(history, checkpointId);
   }
 
@@ -352,7 +529,7 @@ export default function ChatPanel({
   // (repairing any dangling tool calls) and let the model pick up where it
   // stopped, under a fresh checkpoint.
   async function continueTurn() {
-    if (busy || !provider.apiKey || !workspace) return;
+    if (busy || !provider.apiKey || !projectDir) return;
 
     let checkpointId: number | undefined;
     try {
@@ -459,9 +636,43 @@ export default function ChatPanel({
         </button>
       </div>
 
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 4,
+          padding: "5px 10px",
+          borderBottom: "1px solid var(--border-soft)",
+          flexShrink: 0,
+        }}
+      >
+        <Briefcase size={13} style={{ color: "var(--text-dim)", flexShrink: 0 }} />
+        <select
+          value={activeProjectId}
+          onChange={(e) => setActiveProjectId(e.target.value)}
+          title={activeProject?.directory || t("noFolder")}
+          style={{ flex: 1, minWidth: 0, fontSize: 11.5, background: "transparent", border: "none", color: "var(--text)" }}
+        >
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <button className="ghost" onClick={pickProjectFolder} title={t("newProjectFolder")}>
+          <FolderPlus size={13} />
+        </button>
+        {projects.length > 1 && (
+          <button className="ghost" onClick={() => deleteProject(activeProjectId)} title={t("deleteProjectTooltip")}>
+            <Trash2 size={13} />
+          </button>
+        )}
+      </div>
+
       {showHistory && (
         <div style={{ maxHeight: 180, overflowY: "auto", borderBottom: "1px solid var(--border-soft)" }}>
           {sessions
+            .filter((s) => s.projectId === activeProjectId)
             .slice()
             .sort((a, b) => b.createdAt - a.createdAt)
             .map((s) => (
@@ -494,20 +705,20 @@ export default function ChatPanel({
           <div style={{ opacity: 0.45, fontSize: 12.5, textAlign: "center", marginTop: 40, lineHeight: 2 }}>
             <Bot size={28} style={{ opacity: 0.5 }} />
             <br />
-            {workspace ? (
+            {projectDir ? (
               <>
                 {t("emptyChatHint")}
                 <br />
                 <span style={{ fontSize: 11.5 }}>{t("mentionHint")}</span>
               </>
             ) : (
-              t("openFolderFirst")
+              t("noProjectHint")
             )}
           </div>
         )}
         {active.messages.map((m, i) => (
           <div key={i}>
-            <Message msg={m} workspace={workspace} />
+            <Message msg={m} workspace={projectDir} getScreenshot={getScreenshot} />
             {m.role === "user" && m.checkpointId !== undefined && turnHasMutations.has(m.checkpointId) && (
               <div style={{ textAlign: "start", marginTop: 4 }}>
                 <button className="revert-btn" onClick={() => revertTo(m.checkpointId!)}>
@@ -519,7 +730,7 @@ export default function ChatPanel({
         ))}
         {streamingText && (
           <div className="typing">
-            <Message msg={{ role: "assistant", content: streamingText }} workspace={workspace} />
+            <Message msg={{ role: "assistant", content: streamingText }} workspace={projectDir} />
           </div>
         )}
         {busy && !streamingText && (
@@ -528,6 +739,9 @@ export default function ChatPanel({
           >
             <FishLoader size={56} />
             <span className="typing">{notice || t("working")}</span>
+            <span dir="ltr" style={{ opacity: 0.7, fontVariantNumeric: "tabular-nums" }}>
+              {formatElapsed(elapsedMs)}
+            </span>
           </div>
         )}
         {!busy && canContinue && (
@@ -563,12 +777,20 @@ export default function ChatPanel({
           </div>
         )}
 
-        {attachments.length > 0 && (
+        {(attachments.length > 0 || pastedImages.length > 0) && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 7 }}>
             {attachments.map((a) => (
               <span key={a} className="chip" dir="ltr">
                 {a.split("/").pop()}
                 <span className="x" onClick={() => setAttachments((cur) => cur.filter((x) => x !== a))}>
+                  ✕
+                </span>
+              </span>
+            ))}
+            {pastedImages.map((img, i) => (
+              <span key={i} className="chip" style={{ padding: 2, display: "inline-flex", alignItems: "center", gap: 4 }}>
+                <img src={img} alt="pasted" style={{ height: 22, width: 22, objectFit: "cover", borderRadius: 4 }} />
+                <span className="x" onClick={() => setPastedImages((cur) => cur.filter((_, j) => j !== i))}>
                   ✕
                 </span>
               </span>
@@ -585,7 +807,8 @@ export default function ChatPanel({
             disabled={busy}
             onChange={onInputChange}
             onKeyDown={onKeyDown}
-            placeholder={workspace ? t("inputPlaceholder") : t("openFolderFirst")}
+            onPaste={onPasteInput}
+            placeholder={projectDir ? t("inputPlaceholder") : t("noProjectHint")}
             style={{ flex: 1, resize: "none" }}
           />
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
@@ -612,6 +835,28 @@ export default function ChatPanel({
             )}
           </div>
         </div>
+        {lastPromptTokens > 0 && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }} dir="ltr">
+            <span style={{ fontSize: 10.5, color: "var(--text-faint)", whiteSpace: "nowrap" }}>
+              {t("contextWindow")}: {formatK(lastPromptTokens)}/{formatK(active.contextBudget || 200_000)} (
+              {Math.min(100, Math.round((lastPromptTokens / (active.contextBudget || 200_000)) * 100))}%)
+            </span>
+            <div style={{ flex: 1, height: 4, borderRadius: 2, background: "var(--bg-3)", overflow: "hidden" }}>
+              <div
+                style={{
+                  width: `${Math.min(100, (lastPromptTokens / (active.contextBudget || 200_000)) * 100)}%`,
+                  height: "100%",
+                  background:
+                    lastPromptTokens / (active.contextBudget || 200_000) > 0.9
+                      ? "var(--red)"
+                      : lastPromptTokens / (active.contextBudget || 200_000) > 0.7
+                      ? "var(--amber)"
+                      : "var(--accent)",
+                }}
+              />
+            </div>
+          </div>
+        )}
         <div style={{ fontSize: 10.5, color: "var(--text-faint)", marginTop: 6, display: "flex", gap: 10 }}>
           <span>{active.usage.total_tokens.toLocaleString()} {t("tokens")}</span>
           {(active.usage.cached_tokens ?? 0) > 0 && (

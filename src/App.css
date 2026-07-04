@@ -372,6 +372,7 @@ select:focus {
 .msg {
   animation: fadeInUp 0.18s ease;
   max-width: 100%;
+  min-width: 0;
 }
 .msg-user {
   align-self: flex-end;
@@ -384,6 +385,7 @@ select:focus {
   font-size: 13px;
   line-height: 1.55;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .msg-assistant {
   background: var(--bg-2);
@@ -393,6 +395,7 @@ select:focus {
   font-size: 13px;
   line-height: 1.6;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .tool-card {
   display: flex;
@@ -453,6 +456,22 @@ select:focus {
 }
 .chip .x:hover {
   opacity: 1;
+}
+.role-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-1);
+  color: var(--text-dim);
+  border: 1px solid var(--border-soft);
+  border-radius: 20px;
+  padding: 2px 9px;
+  font-size: 11.5px;
+}
+.role-pill.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .revert-btn {
@@ -678,6 +697,8 @@ select:focus {
 .markdown-body pre {
   margin: 6px 0;
   direction: ltr;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .markdown-body ul,
 .markdown-body ol {
@@ -692,6 +713,8 @@ select:focus {
   font-size: 12px;
   direction: ltr;
   unicode-bidi: embed;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .markdown-body a {
   color: var(--accent);
@@ -705,6 +728,77 @@ select:focus {
   border: 1px solid var(--border);
   padding: 4px 8px;
   font-size: 12px;
+}
+
+/* ---------- Preview panel: toolbar, JSON tree, tables, images ---------- */
+.preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border-soft);
+  flex-shrink: 0;
+}
+.json-row {
+  padding: 1px 0;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.json-toggle {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.json-toggle:hover {
+  color: var(--text);
+}
+.json-key {
+  color: var(--accent);
+}
+.json-string {
+  color: var(--green);
+}
+.json-number,
+.json-bool {
+  color: var(--gold);
+}
+.json-null {
+  color: var(--text-faint);
+}
+.json-bracket {
+  color: var(--text-faint);
+}
+.table-preview table {
+  border-collapse: collapse;
+  font-size: 12px;
+  width: 100%;
+}
+.table-preview th,
+.table-preview td {
+  border: 1px solid var(--border-soft);
+  padding: 4px 10px;
+  text-align: start;
+  white-space: nowrap;
+}
+.table-preview th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-1);
+}
+.table-preview tbody tr:nth-child(even) {
+  background: var(--bg-1);
+}
+.image-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  overflow: auto;
+  background-image: repeating-conic-gradient(var(--bg-1) 0% 25%, var(--bg-0) 0% 50%);
+  background-size: 20px 20px;
 }
 
 ::-webkit-scrollbar {

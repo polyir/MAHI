@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { reportRateLimitReset } from "./ide/limits";
 import { t } from "./ide/i18n";
+import { Provider, ProviderRole, findProviderForRole, isBrowserToolsEnabled } from "./ide/providers";
 
 export type ToolCall = {
   id: string;
@@ -22,6 +23,11 @@ export type Msg = {
   // Set on user messages: checkpoint taken before this turn's file mutations,
   // enabling one-click revert of everything the turn changed.
   checkpointId?: number;
+  // User-pasted images (data: URLs, already downscaled/recompressed — see
+  // ChatPanel's paste handler), sent to the model as real vision content.
+  // Only ever set on role: "user" messages. Older turns' images are dropped
+  // during compaction (see compactHistory) so they aren't resent forever.
+  images?: string[];
 };
 
 export type Usage = {
@@ -49,11 +55,39 @@ export const SENSITIVE_TOOLS = new Set([
   "delete_file",
   "move_file",
   "run_command",
+  "generate_image",
+  "generate_audio",
+  "generate_video",
+  "browser_navigate",
+  "browser_close",
+]);
+
+// Embedded-browser tools are handled by a separate dispatch path (they don't
+// touch the filesystem — they control React state in App.tsx via the
+// BrowserControl callbacks passed through AgentOptions) and are only sent to
+// the model at all when isBrowserToolsEnabled() is on.
+const BROWSER_TOOL_NAMES = new Set([
+  "browser_open",
+  "browser_navigate",
+  "browser_close",
+  "browser_screenshot",
 ]);
 
 // File-mutating tools snapshot the previous state into the turn's checkpoint
-// so the user can revert the whole turn.
+// so the user can revert the whole turn. Media-generation tools are
+// deliberately NOT included: checkpoint_record reads the "before" content as
+// UTF-8 text, so on a binary file it silently records "did not exist" and a
+// revert would DELETE the file instead of restoring its bytes. Until
+// checkpoint.rs gets a binary-safe snapshot, generated media is excluded
+// from turn-revert rather than risk destroying it.
 const CHECKPOINTED_TOOLS = new Set(["write_file", "edit_file", "delete_file", "move_file"]);
+
+// Tool name -> which provider role should serve it, when role routing is on.
+const MEDIA_TOOLS: Record<string, ProviderRole> = {
+  generate_image: "image",
+  generate_audio: "audio",
+  generate_video: "video",
+};
 
 const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
@@ -184,6 +218,109 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "generate_image",
+      description:
+        "Generate an image from a text prompt and save it into the workspace. Uses whichever provider is configured with the 'image' role (Settings → Providers), or the current chat provider if role routing is off or no image provider is configured.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          path: { type: "string", description: "where to save the image, relative to the workspace root, e.g. 'assets/hero.png'" },
+          size: { type: "string", description: "e.g. '1024x1024'" },
+        },
+        required: ["prompt", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "generate_audio",
+      description:
+        "Generate speech audio from text and save it into the workspace. Uses whichever provider is configured with the 'audio' role, or falls back to the current chat provider.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          path: { type: "string" },
+          voice: { type: "string" },
+        },
+        required: ["text", "path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "generate_video",
+      description:
+        "Generate a short video from a text prompt and save it into the workspace. Uses whichever provider is configured with the 'video' role. Most OpenAI-compatible providers do not support this yet; expect a clear error unless the routed provider's endpoint exists.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string" },
+          path: { type: "string" },
+        },
+        required: ["prompt", "path"],
+      },
+    },
+  },
+];
+
+// Only appended to the request when isBrowserToolsEnabled() is on (Settings
+// → Providers). There is no browser_read/click/type: the embedded browser is
+// a plain iframe, and cross-origin iframe content is invisible to the parent
+// page's JS by browser security design — so these tools are deliberately
+// view-and-navigate only, not automation.
+const BROWSER_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "browser_open",
+      description:
+        "Open a URL in a new embedded browser tab (visible to the user in the preview panel) and make it the active tab. Returns the new tab's id. Note: some sites (Google, banks, many login-gated apps) refuse to load in an iframe and will show a blank/error page — that's a site restriction, not a bug.",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_navigate",
+      description: "Navigate an embedded browser tab to a new URL. Defaults to the currently active browser tab if tab_id is omitted.",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" }, tab_id: { type: "string" } },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_close",
+      description: "Close an embedded browser tab. Defaults to the currently active tab if tab_id is omitted.",
+      parameters: {
+        type: "object",
+        properties: { tab_id: { type: "string" } },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_screenshot",
+      description:
+        "Take a screenshot of the whole MAHI window, including the active embedded browser tab if one is open, so the user can see what's currently on screen. This is view-only for you: you will NOT receive the image back (no vision input) and there is no way to read the page's text or click/type into it — use it purely to let the user look at the current state, not to inspect page content yourself.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
 ];
 
 // Tool results feed straight into conversation history, which gets resent in
@@ -293,6 +430,103 @@ export function makeClient(apiKey: string, baseURL = "https://api.sakana.ai/v1")
   });
 }
 
+/// Media-generation tools run against whichever provider owns that role
+/// (see findProviderForRole), which may differ from the chat provider —
+/// so they build their own short-lived client rather than reusing runTool's.
+async function runMediaTool(provider: Provider, workspace: string, name: string, args: any): Promise<string> {
+  try {
+    const client = makeClient(provider.apiKey, provider.baseURL);
+    if (name === "generate_image") {
+      const model = provider.imageModel || provider.models[0];
+      const resp = await client.images.generate({
+        model,
+        prompt: args.prompt,
+        size: args.size,
+        response_format: "b64_json",
+      } as any);
+      const b64 = (resp.data?.[0] as any)?.b64_json;
+      if (!b64) return "error: provider did not return image data (it may not support image generation)";
+      await invoke("write_file_binary", { workspace, path: args.path, base64Content: b64 });
+      return `ok: image saved to ${args.path} (via provider "${provider.name}")`;
+    }
+    if (name === "generate_audio") {
+      const model = provider.audioModel || provider.models[0];
+      const resp = await client.audio.speech.create({
+        model,
+        voice: (args.voice || "alloy") as any,
+        input: args.text,
+      });
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
+      const b64 = btoa(binary);
+      await invoke("write_file_binary", { workspace, path: args.path, base64Content: b64 });
+      return `ok: audio saved to ${args.path} (via provider "${provider.name}")`;
+    }
+    if (name === "generate_video") {
+      return "error: video generation is not supported by the OpenAI-compatible SDK surface — no standard endpoint exists yet for this provider.";
+    }
+    return `unknown media tool: ${name}`;
+  } catch (e) {
+    return `error: ${String(e)}`;
+  }
+}
+
+// Backs the embedded-browser tools. Implemented in App.tsx against React
+// state (the browser tabs live there, not in Rust) — navigate/close return
+// null/false when the given (or default active) tab id doesn't exist.
+export type BrowserControl = {
+  open: (url: string) => string;
+  navigate: (url: string, tabId?: string) => string | null;
+  close: (tabId?: string) => boolean;
+  screenshot: () => Promise<string>;
+};
+
+/// Dispatches browser_* tool calls against the BrowserControl passed from
+/// App.tsx. The screenshot's base64 payload is stashed on `args` (mutated in
+/// place, mirroring write_file's `args.__oldContent` pattern) purely for
+/// ToolCallView renders the screenshot via onScreenshot, keyed by tool_call_id
+/// — deliberately NOT stashed on the Msg/toolArgs that ends up in `history`.
+/// A full-window PNG easily runs into multiple MB as base64; putting that on
+/// a persisted Msg would mean: it gets JSON.stringify'd and resent to the API
+/// on every later call in the conversation (a multi-MB string can visibly
+/// hang the render thread), and it gets written into localStorage on every
+/// session change (risking a quota-exceeded error — see the sessions-save
+/// effect in ChatPanel.tsx). Keeping it in an in-memory-only side channel
+/// avoids all of that; the trade-off is screenshots don't survive a reload,
+/// which is fine for a "look at the current state" utility.
+async function runBrowserTool(
+  control: BrowserControl | undefined,
+  name: string,
+  args: any,
+  onScreenshot?: (b64: string) => void
+): Promise<string> {
+  if (!control) return "error: embedded browser is not available right now";
+  try {
+    if (name === "browser_open") {
+      const id = control.open(args.url);
+      return `ok: opened tab ${id} → ${args.url}`;
+    }
+    if (name === "browser_navigate") {
+      const id = control.navigate(args.url, args.tab_id);
+      return id
+        ? `ok: navigated tab ${id} → ${args.url}`
+        : "error: tab not found (pass a valid tab_id, or omit it to use the active tab)";
+    }
+    if (name === "browser_close") {
+      return control.close(args.tab_id) ? "ok: tab closed" : "error: tab not found";
+    }
+    if (name === "browser_screenshot") {
+      const b64 = await control.screenshot();
+      onScreenshot?.(b64);
+      return "ok: screenshot captured (shown to the user in this tool card — you cannot see it yourself)";
+    }
+    return `unknown browser tool: ${name}`;
+  } catch (e) {
+    return `error: ${String(e)}`;
+  }
+}
+
 export type AgentOptions = {
   reasoningEffort?: ReasoningEffort;
   temperature?: number;
@@ -308,6 +542,19 @@ export type AgentOptions = {
   onHeaders?: (headers: Record<string, string>) => void;
   onNotice?: (text: string) => void;
   requestApproval: (toolName: string, args: any) => Promise<boolean>;
+  // Needed to route generate_image/generate_audio/generate_video to
+  // whichever provider owns that role, which may differ from the provider
+  // driving this chat turn. chatProvider is also the fallback when role
+  // routing is off or no provider claims the role.
+  chatProvider?: Provider;
+  allProviders?: Provider[];
+  // Backs browser_open/navigate/close/screenshot when isBrowserToolsEnabled()
+  // is on. Undefined is treated as "browser tools unavailable".
+  browserControl?: BrowserControl;
+  // Delivers a browser_screenshot's base64 PNG straight to the UI, keyed by
+  // the tool call's id — see runBrowserTool's comment for why this must stay
+  // out of the persisted Msg/history instead of being returned as text.
+  onScreenshot?: (toolCallId: string, base64: string) => void;
 };
 
 function isRetryable(e: any): boolean {
@@ -413,7 +660,20 @@ export function compactHistory(messages: Msg[]): Msg[] {
       break;
     }
   }
-  return messages.map((m, i) => (i < lastUserIdx && m.role !== "user" ? stubMsg(m) : m));
+  return messages.map((m, i) => {
+    if (i >= lastUserIdx) return m;
+    const stubbed = m.role !== "user" ? stubMsg(m) : m;
+    // User text is otherwise pinned verbatim (cheap), but pasted images are
+    // not — resending them on every subsequent call for the rest of the
+    // conversation would be expensive for zero benefit once the turn that
+    // introduced them is done. Drop images from older turns only.
+    if (!stubbed.images?.length) return stubbed;
+    return {
+      ...stubbed,
+      images: undefined,
+      content: `${stubbed.content}\n[${stubbed.images.length} image(s) omitted after compaction — no longer sent to the model]`,
+    };
+  });
 }
 
 // ---- token estimation (self-calibrating) ----
@@ -439,6 +699,10 @@ export function historyChars(history: Msg[]): number {
   for (const m of history) {
     n += m.content.length;
     if (m.tool_calls) for (const tc of m.tool_calls) n += tc.function.arguments.length + 40;
+    // Rough token-equivalent padding for vision input — there's no real
+    // tokenizer for this, but ignoring images entirely would badly
+    // undercount the budget once any are attached.
+    if (m.images?.length) n += m.images.length * 6000;
   }
   return n;
 }
@@ -507,6 +771,7 @@ export async function agentTurn(
   // for the whole content again (in every subsequent call of the turn).
   const readSeen = new Map<string, string>();
   const budget = opts.contextBudget ?? 200_000;
+  const activeTools = isBrowserToolsEnabled() ? [...tools, ...BROWSER_TOOLS] : tools;
 
   // Each iteration is a full re-bill of the conversation, so the cap is the
   // last defense against runaway spend. If a legit big task hits it, the
@@ -530,10 +795,27 @@ export async function agentTurn(
     }
     const sentChars = chars;
 
+    // Only messages that actually carry pasted images need reshaping into
+    // OpenAI's multipart vision format; everything else is sent exactly as
+    // before (unchanged risk/behavior for the common no-image case).
+    const apiMessages = history.some((m) => m.images?.length)
+      ? history.map((m) =>
+          m.images?.length
+            ? {
+                role: m.role,
+                content: [
+                  ...(m.content ? [{ type: "text", text: m.content }] : []),
+                  ...m.images.map((url) => ({ type: "image_url", image_url: { url } })),
+                ],
+              }
+            : m
+        )
+      : history;
+
     const params: any = {
       model,
-      messages: history,
-      tools,
+      messages: apiMessages,
+      tools: activeTools,
       stream: true,
       stream_options: { include_usage: true },
     };
@@ -642,7 +924,28 @@ export async function agentTurn(
       }
 
       let result: string;
-      if (SENSITIVE_TOOLS.has(call.function.name)) {
+      if (call.function.name in MEDIA_TOOLS) {
+        const approved = await opts.requestApproval(call.function.name, args);
+        if (!approved) {
+          result = "Rejected by user. Do not retry this exact action without asking.";
+        } else if (!opts.chatProvider) {
+          result = "error: no provider available to route this media tool";
+        } else {
+          const role = MEDIA_TOOLS[call.function.name];
+          const roleProvider = findProviderForRole(opts.allProviders ?? [], role, opts.chatProvider);
+          result = await runMediaTool(roleProvider, workspace, call.function.name, args);
+        }
+      } else if (BROWSER_TOOL_NAMES.has(call.function.name)) {
+        const onScreenshot = opts.onScreenshot ? (b64: string) => opts.onScreenshot!(call.id, b64) : undefined;
+        if (SENSITIVE_TOOLS.has(call.function.name)) {
+          const approved = await opts.requestApproval(call.function.name, args);
+          result = approved
+            ? await runBrowserTool(opts.browserControl, call.function.name, args, onScreenshot)
+            : "Rejected by user. Do not retry this exact action without asking.";
+        } else {
+          result = await runBrowserTool(opts.browserControl, call.function.name, args, onScreenshot);
+        }
+      } else if (SENSITIVE_TOOLS.has(call.function.name)) {
         const approved = await opts.requestApproval(call.function.name, args);
         result = approved
           ? await runTool(workspace, call.function.name, args, opts.checkpointId)

@@ -1,38 +1,38 @@
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Msg } from "../agent";
 import ToolCallView from "./ToolCallView";
+import CodeBlock from "./CodeBlock";
 import { t } from "../ide/i18n";
 
-function CodeBlock({ className, children }: { className?: string; children: React.ReactNode }) {
-  const match = /language-(\w+)/.exec(className || "");
-  const code = String(children).replace(/\n$/, "");
-  if (!match) {
-    return <code className="inline-code">{code}</code>;
-  }
-  return (
-    <div dir="ltr">
-      <SyntaxHighlighter
-        language={match[1]}
-        style={oneDark}
-        customStyle={{ margin: "6px 0", borderRadius: 8, fontSize: 12.5 }}
-      >
-        {code}
-      </SyntaxHighlighter>
-    </div>
-  );
-}
-
-export default function Message({ msg, workspace }: { msg: Msg; workspace: string }) {
+export default function Message({
+  msg,
+  workspace,
+  getScreenshot,
+}: {
+  msg: Msg;
+  workspace: string;
+  getScreenshot?: (toolCallId?: string) => string | undefined;
+}) {
   if (msg.role === "tool") {
-    return <ToolCallView msg={msg} workspace={workspace} />;
+    return <ToolCallView msg={msg} workspace={workspace} screenshot={getScreenshot?.(msg.tool_call_id)} />;
   }
 
   if (msg.role === "user") {
     return (
       <div className="msg msg-user" dir="auto">
+        {msg.images && msg.images.length > 0 && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+            {msg.images.map((img, i) => (
+              <img
+                key={i}
+                src={img}
+                alt="pasted"
+                style={{ maxWidth: 160, maxHeight: 160, borderRadius: 8, display: "block" }}
+              />
+            ))}
+          </div>
+        )}
         {msg.content.split("\n\n[Attached file:")[0]}
         {msg.content.includes("[Attached file:") && (
           <div style={{ fontSize: 11, opacity: 0.75, marginTop: 4 }}>{t("withAttachment")}</div>

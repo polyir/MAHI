@@ -32,6 +32,9 @@ export type Session = {
   // Prompt-history budget (estimated tokens). Default stays under Sakana's
   // 272k price cliff, where input pricing doubles.
   contextBudget: number;
+  // Which project (see ./projects.ts) this chat's tool calls operate on —
+  // independent of whatever folder happens to be open in the IDE.
+  projectId: string;
 };
 
 export const SESSIONS_KEY = "vibe_sessions_v2";
@@ -44,6 +47,9 @@ export function loadSessions(): Session[] {
       ...s,
       reasoningEffort: sanitizeEffort(s.reasoningEffort),
       contextBudget: s.contextBudget || 200_000,
+      // Sessions created before projects existed all belonged to the one
+      // implicit project (see projects.ts's back-compat "default" seed).
+      projectId: s.projectId || "default",
       // Upgrade sessions still on any older default prompt (user hasn't
       // customized it) to the current default. Custom prompts won't start
       // with either known prefix, so they are preserved.
@@ -60,7 +66,7 @@ export function loadSessions(): Session[] {
   }
 }
 
-export function newSession(): Session {
+export function newSession(projectId: string): Session {
   return {
     id: crypto.randomUUID(),
     title: t("newChat"),
@@ -72,5 +78,6 @@ export function newSession(): Session {
     temperature: 0.7,
     autoApprove: false,
     contextBudget: 200_000,
+    projectId,
   };
 }
