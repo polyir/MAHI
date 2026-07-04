@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { reportRateLimitReset } from "./ide/limits";
 import { t } from "./ide/i18n";
-import { Provider, ProviderRole, findProviderForRole } from "./ide/providers";
+import { Provider, ProviderRole, findProviderForRole, isBrowserToolsEnabled } from "./ide/providers";
 
 export type ToolCall = {
   id: string;
@@ -23,6 +23,11 @@ export type Msg = {
   // Set on user messages: checkpoint taken before this turn's file mutations,
   // enabling one-click revert of everything the turn changed.
   checkpointId?: number;
+  // User-pasted images (data: URLs, already downscaled/recompressed — see
+  // ChatPanel's paste handler), sent to the model as real vision content.
+  // Only ever set on role: "user" messages. Older turns' images are dropped
+  // during compaction (see compactHistory) so they aren't resent forever.
+  images?: string[];
 };
 
 export type Usage = {
@@ -53,6 +58,19 @@ export const SENSITIVE_TOOLS = new Set([
   "generate_image",
   "generate_audio",
   "generate_video",
+  "browser_navigate",
+  "browser_close",
+]);
+
+// Embedded-browser tools are handled by a separate dispatch path (they don't
+// touch the filesystem — they control React state in App.tsx via the
+// BrowserControl callbacks passed through AgentOptions) and are only sent to
+// the model at all when isBrowserToolsEnabled() is on.
+const BROWSER_TOOL_NAMES = new Set([
+  "browser_open",
+  "browser_navigate",
+  "browser_close",
+  "browser_screenshot",
 ]);
 
 // File-mutating tools snapshot the previous state into the turn's checkpoint
@@ -252,6 +270,59 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   },
 ];
 
+// Only appended to the request when isBrowserToolsEnabled() is on (Settings
+// → Providers). There is no browser_read/click/type: the embedded browser is
+// a plain iframe, and cross-origin iframe content is invisible to the parent
+// page's JS by browser security design — so these tools are deliberately
+// view-and-navigate only, not automation.
+const BROWSER_TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "browser_open",
+      description:
+        "Open a URL in a new embedded browser tab (visible to the user in the preview panel) and make it the active tab. Returns the new tab's id. Note: some sites (Google, banks, many login-gated apps) refuse to load in an iframe and will show a blank/error page — that's a site restriction, not a bug.",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" } },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_navigate",
+      description: "Navigate an embedded browser tab to a new URL. Defaults to the currently active browser tab if tab_id is omitted.",
+      parameters: {
+        type: "object",
+        properties: { url: { type: "string" }, tab_id: { type: "string" } },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_close",
+      description: "Close an embedded browser tab. Defaults to the currently active tab if tab_id is omitted.",
+      parameters: {
+        type: "object",
+        properties: { tab_id: { type: "string" } },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "browser_screenshot",
+      description:
+        "Take a screenshot of the whole MAHI window, including the active embedded browser tab if one is open, so the user can see what's currently on screen. This is view-only for you: you will NOT receive the image back (no vision input) and there is no way to read the page's text or click/type into it — use it purely to let the user look at the current state, not to inspect page content yourself.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+];
+
 // Tool results feed straight into conversation history, which gets resent in
 // full on every subsequent API call for the rest of the session. Uncapped
 // file dumps or command logs are the single biggest source of runaway token
@@ -401,6 +472,61 @@ async function runMediaTool(provider: Provider, workspace: string, name: string,
   }
 }
 
+// Backs the embedded-browser tools. Implemented in App.tsx against React
+// state (the browser tabs live there, not in Rust) — navigate/close return
+// null/false when the given (or default active) tab id doesn't exist.
+export type BrowserControl = {
+  open: (url: string) => string;
+  navigate: (url: string, tabId?: string) => string | null;
+  close: (tabId?: string) => boolean;
+  screenshot: () => Promise<string>;
+};
+
+/// Dispatches browser_* tool calls against the BrowserControl passed from
+/// App.tsx. The screenshot's base64 payload is stashed on `args` (mutated in
+/// place, mirroring write_file's `args.__oldContent` pattern) purely for
+/// ToolCallView renders the screenshot via onScreenshot, keyed by tool_call_id
+/// — deliberately NOT stashed on the Msg/toolArgs that ends up in `history`.
+/// A full-window PNG easily runs into multiple MB as base64; putting that on
+/// a persisted Msg would mean: it gets JSON.stringify'd and resent to the API
+/// on every later call in the conversation (a multi-MB string can visibly
+/// hang the render thread), and it gets written into localStorage on every
+/// session change (risking a quota-exceeded error — see the sessions-save
+/// effect in ChatPanel.tsx). Keeping it in an in-memory-only side channel
+/// avoids all of that; the trade-off is screenshots don't survive a reload,
+/// which is fine for a "look at the current state" utility.
+async function runBrowserTool(
+  control: BrowserControl | undefined,
+  name: string,
+  args: any,
+  onScreenshot?: (b64: string) => void
+): Promise<string> {
+  if (!control) return "error: embedded browser is not available right now";
+  try {
+    if (name === "browser_open") {
+      const id = control.open(args.url);
+      return `ok: opened tab ${id} → ${args.url}`;
+    }
+    if (name === "browser_navigate") {
+      const id = control.navigate(args.url, args.tab_id);
+      return id
+        ? `ok: navigated tab ${id} → ${args.url}`
+        : "error: tab not found (pass a valid tab_id, or omit it to use the active tab)";
+    }
+    if (name === "browser_close") {
+      return control.close(args.tab_id) ? "ok: tab closed" : "error: tab not found";
+    }
+    if (name === "browser_screenshot") {
+      const b64 = await control.screenshot();
+      onScreenshot?.(b64);
+      return "ok: screenshot captured (shown to the user in this tool card — you cannot see it yourself)";
+    }
+    return `unknown browser tool: ${name}`;
+  } catch (e) {
+    return `error: ${String(e)}`;
+  }
+}
+
 export type AgentOptions = {
   reasoningEffort?: ReasoningEffort;
   temperature?: number;
@@ -422,6 +548,13 @@ export type AgentOptions = {
   // routing is off or no provider claims the role.
   chatProvider?: Provider;
   allProviders?: Provider[];
+  // Backs browser_open/navigate/close/screenshot when isBrowserToolsEnabled()
+  // is on. Undefined is treated as "browser tools unavailable".
+  browserControl?: BrowserControl;
+  // Delivers a browser_screenshot's base64 PNG straight to the UI, keyed by
+  // the tool call's id — see runBrowserTool's comment for why this must stay
+  // out of the persisted Msg/history instead of being returned as text.
+  onScreenshot?: (toolCallId: string, base64: string) => void;
 };
 
 function isRetryable(e: any): boolean {
@@ -527,7 +660,20 @@ export function compactHistory(messages: Msg[]): Msg[] {
       break;
     }
   }
-  return messages.map((m, i) => (i < lastUserIdx && m.role !== "user" ? stubMsg(m) : m));
+  return messages.map((m, i) => {
+    if (i >= lastUserIdx) return m;
+    const stubbed = m.role !== "user" ? stubMsg(m) : m;
+    // User text is otherwise pinned verbatim (cheap), but pasted images are
+    // not — resending them on every subsequent call for the rest of the
+    // conversation would be expensive for zero benefit once the turn that
+    // introduced them is done. Drop images from older turns only.
+    if (!stubbed.images?.length) return stubbed;
+    return {
+      ...stubbed,
+      images: undefined,
+      content: `${stubbed.content}\n[${stubbed.images.length} image(s) omitted after compaction — no longer sent to the model]`,
+    };
+  });
 }
 
 // ---- token estimation (self-calibrating) ----
@@ -553,6 +699,10 @@ export function historyChars(history: Msg[]): number {
   for (const m of history) {
     n += m.content.length;
     if (m.tool_calls) for (const tc of m.tool_calls) n += tc.function.arguments.length + 40;
+    // Rough token-equivalent padding for vision input — there's no real
+    // tokenizer for this, but ignoring images entirely would badly
+    // undercount the budget once any are attached.
+    if (m.images?.length) n += m.images.length * 6000;
   }
   return n;
 }
@@ -621,6 +771,7 @@ export async function agentTurn(
   // for the whole content again (in every subsequent call of the turn).
   const readSeen = new Map<string, string>();
   const budget = opts.contextBudget ?? 200_000;
+  const activeTools = isBrowserToolsEnabled() ? [...tools, ...BROWSER_TOOLS] : tools;
 
   // Each iteration is a full re-bill of the conversation, so the cap is the
   // last defense against runaway spend. If a legit big task hits it, the
@@ -644,10 +795,27 @@ export async function agentTurn(
     }
     const sentChars = chars;
 
+    // Only messages that actually carry pasted images need reshaping into
+    // OpenAI's multipart vision format; everything else is sent exactly as
+    // before (unchanged risk/behavior for the common no-image case).
+    const apiMessages = history.some((m) => m.images?.length)
+      ? history.map((m) =>
+          m.images?.length
+            ? {
+                role: m.role,
+                content: [
+                  ...(m.content ? [{ type: "text", text: m.content }] : []),
+                  ...m.images.map((url) => ({ type: "image_url", image_url: { url } })),
+                ],
+              }
+            : m
+        )
+      : history;
+
     const params: any = {
       model,
-      messages: history,
-      tools,
+      messages: apiMessages,
+      tools: activeTools,
       stream: true,
       stream_options: { include_usage: true },
     };
@@ -766,6 +934,16 @@ export async function agentTurn(
           const role = MEDIA_TOOLS[call.function.name];
           const roleProvider = findProviderForRole(opts.allProviders ?? [], role, opts.chatProvider);
           result = await runMediaTool(roleProvider, workspace, call.function.name, args);
+        }
+      } else if (BROWSER_TOOL_NAMES.has(call.function.name)) {
+        const onScreenshot = opts.onScreenshot ? (b64: string) => opts.onScreenshot!(call.id, b64) : undefined;
+        if (SENSITIVE_TOOLS.has(call.function.name)) {
+          const approved = await opts.requestApproval(call.function.name, args);
+          result = approved
+            ? await runBrowserTool(opts.browserControl, call.function.name, args, onScreenshot)
+            : "Rejected by user. Do not retry this exact action without asking.";
+        } else {
+          result = await runBrowserTool(opts.browserControl, call.function.name, args, onScreenshot);
         }
       } else if (SENSITIVE_TOOLS.has(call.function.name)) {
         const approved = await opts.requestApproval(call.function.name, args);

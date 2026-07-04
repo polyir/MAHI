@@ -179,12 +179,45 @@ export default function App() {
 
   function navigateBrowserTab(id: string, url: string) {
     setBrowserTabs((cur) => cur.map((b) => (b.id === id ? { ...b, url } : b)));
-    invoke("browser_navigate", { tabId: id, url }).catch(() => {});
   }
 
   function focusBrowser() {
     if (browserTabs.length === 0) newBrowserTab();
     else setActiveBrowserId((cur) => cur ?? browserTabs[browserTabs.length - 1].id);
+  }
+
+  // Mirrors of browser state for the agent's browser_* tools, which are
+  // dispatched from agent.ts outside React's render cycle — reading through
+  // a ref (rather than closing over the state variable) keeps them looking
+  // at the current tabs even mid-turn.
+  const browserTabsRef = useRef(browserTabs);
+  browserTabsRef.current = browserTabs;
+  const activeBrowserIdRef = useRef(activeBrowserId);
+  activeBrowserIdRef.current = activeBrowserId;
+
+  function agentBrowserOpen(url: string): string {
+    const id = crypto.randomUUID();
+    setBrowserTabs((cur) => [...cur, { id, url, title: "" }]);
+    setActiveBrowserId(id);
+    return id;
+  }
+
+  function agentBrowserNavigate(url: string, tabId?: string): string | null {
+    const targetId = tabId || activeBrowserIdRef.current;
+    if (!targetId || !browserTabsRef.current.some((b) => b.id === targetId)) return null;
+    setBrowserTabs((cur) => cur.map((b) => (b.id === targetId ? { ...b, url } : b)));
+    return targetId;
+  }
+
+  function agentBrowserClose(tabId?: string): boolean {
+    const targetId = tabId || activeBrowserIdRef.current;
+    if (!targetId || !browserTabsRef.current.some((b) => b.id === targetId)) return false;
+    closeBrowserTab(targetId);
+    return true;
+  }
+
+  async function agentBrowserScreenshot(): Promise<string> {
+    return invoke<string>("window_screenshot");
   }
 
   function changeTab(path: string, content: string) {
@@ -437,6 +470,12 @@ export default function App() {
                   onUsageChange={setTotalTokens}
                   onHeaders={setUsageHeaders}
                   toast={toast}
+                  browserControl={{
+                    open: agentBrowserOpen,
+                    navigate: agentBrowserNavigate,
+                    close: agentBrowserClose,
+                    screenshot: agentBrowserScreenshot,
+                  }}
                 />
               </Panel>
             )}

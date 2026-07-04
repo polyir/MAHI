@@ -1,7 +1,7 @@
-mod browser;
 mod checkpoint;
 mod media;
 mod pty;
+mod screenshot;
 
 use regex::Regex;
 use serde::Serialize;
@@ -364,11 +364,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             read_file,
             register_asset_scope,
-            browser::browser_open,
-            browser::browser_reposition,
-            browser::browser_navigate,
-            browser::browser_hide,
-            browser::browser_close,
+            screenshot::window_screenshot,
             write_file,
             media::write_file_binary,
             edit_file,

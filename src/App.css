@@ -372,6 +372,7 @@ select:focus {
 .msg {
   animation: fadeInUp 0.18s ease;
   max-width: 100%;
+  min-width: 0;
 }
 .msg-user {
   align-self: flex-end;
@@ -384,6 +385,7 @@ select:focus {
   font-size: 13px;
   line-height: 1.55;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .msg-assistant {
   background: var(--bg-2);
@@ -393,6 +395,7 @@ select:focus {
   font-size: 13px;
   line-height: 1.6;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .tool-card {
   display: flex;
@@ -694,6 +697,8 @@ select:focus {
 .markdown-body pre {
   margin: 6px 0;
   direction: ltr;
+  max-width: 100%;
+  overflow-x: auto;
 }
 .markdown-body ul,
 .markdown-body ol {
@@ -708,6 +713,8 @@ select:focus {
   font-size: 12px;
   direction: ltr;
   unicode-bidi: embed;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .markdown-body a {
   color: var(--accent);

@@ -13,6 +13,8 @@ import {
   Image,
   Music,
   Video,
+  Globe,
+  Camera,
 } from "lucide-react";
 import { Msg } from "../agent";
 import DiffView from "./DiffView";
@@ -32,6 +34,10 @@ const TOOL_ICONS: Record<string, React.ReactNode> = {
   generate_image: <Image size={13} />,
   generate_audio: <Music size={13} />,
   generate_video: <Video size={13} />,
+  browser_open: <Globe size={13} />,
+  browser_navigate: <Globe size={13} />,
+  browser_close: <Globe size={13} />,
+  browser_screenshot: <Camera size={13} />,
 };
 
 function summarize(name: string, args: any): string {
@@ -55,12 +61,28 @@ function summarize(name: string, args: any): string {
     case "generate_audio":
     case "generate_video":
       return `${name} ${args?.path ?? ""}`;
+    case "browser_open":
+      return `browser_open ${args?.url ?? ""}`;
+    case "browser_navigate":
+      return `browser_navigate ${args?.tab_id ? `[${args.tab_id}] ` : ""}${args?.url ?? ""}`;
+    case "browser_close":
+      return `browser_close ${args?.tab_id ?? "(active tab)"}`;
+    case "browser_screenshot":
+      return "browser_screenshot";
     default:
       return name;
   }
 }
 
-export default function ToolCallView({ msg, workspace }: { msg: Msg; workspace: string }) {
+export default function ToolCallView({
+  msg,
+  workspace,
+  screenshot,
+}: {
+  msg: Msg;
+  workspace: string;
+  screenshot?: string;
+}) {
   const [open, setOpen] = useState(false);
   const name = msg.toolName ?? "tool";
   const args = msg.toolArgs ?? {};
@@ -121,7 +143,17 @@ export default function ToolCallView({ msg, workspace }: { msg: Msg; workspace: 
           {name === "generate_audio" && !isError && (
             <MediaPreview workspace={workspace} path={args.path} kind="audio" />
           )}
-          {(["list_dir", "glob_files", "search_files", "delete_file", "move_file"].includes(name) ||
+          {name === "browser_screenshot" && !isError && screenshot && (
+            <img
+              src={`data:image/png;base64,${screenshot}`}
+              alt="screenshot"
+              style={{ maxWidth: "100%", borderRadius: 6, display: "block" }}
+            />
+          )}
+          {name === "browser_screenshot" && !isError && !screenshot && (
+            <div style={{ fontSize: 11.5, opacity: 0.6 }}>{msg.content}</div>
+          )}
+          {(["list_dir", "glob_files", "search_files", "delete_file", "move_file", "browser_open", "browser_navigate", "browser_close"].includes(name) ||
             (name === "run_command" && !parsedRunResult) ||
             name === "generate_video" ||
             isError) && (

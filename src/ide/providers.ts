@@ -25,6 +25,7 @@ export type Provider = {
 const PROVIDERS_KEY = "mahi_providers";
 const ACTIVE_PROVIDER_KEY = "mahi_active_provider";
 const ROLE_ROUTING_KEY = "mahi_role_routing_enabled";
+const BROWSER_TOOLS_KEY = "mahi_browser_tools_enabled";
 
 export function defaultProviders(): Provider[] {
   return [
@@ -59,6 +60,17 @@ export function isRoleRoutingEnabled(): boolean {
 
 export function setRoleRoutingEnabled(v: boolean): void {
   localStorage.setItem(ROLE_ROUTING_KEY, v ? "1" : "0");
+}
+
+// Off by default: lets the agent open/navigate/close embedded browser tabs
+// and take whole-window screenshots. Sensitive actions (navigate/close)
+// still require per-call approval regardless of this flag.
+export function isBrowserToolsEnabled(): boolean {
+  return localStorage.getItem(BROWSER_TOOLS_KEY) === "1";
+}
+
+export function setBrowserToolsEnabled(v: boolean): void {
+  localStorage.setItem(BROWSER_TOOLS_KEY, v ? "1" : "0");
 }
 
 /// Find the provider assigned to `role`, falling back to `fallback` (the

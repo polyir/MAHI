@@ -1,72 +1,28 @@
-import { useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-
 export type BrowserTab = { id: string; url: string; title: string };
 
-// Hosts one native child webview (a real OS-level surface, not a DOM
-// element). All open browser tabs stay mounted for their whole lifetime —
-// only the active one's webview is shown (via show/hide, not
-// create/destroy) so switching tabs preserves each one's session/history.
-// No toolbar lives inside this component — the address bar and tab strip
-// are rendered by EditorArea below the content area, since Tauri's
-// experimental multiwebview positioning can extend a wide child webview
-// upward past its intended top edge, covering whatever sits above it.
+// A plain iframe per tab. All open tabs stay mounted for their whole
+// lifetime — only the active one is display:block — so switching tabs
+// preserves each one's session/history, same as the previous native
+// child-webview approach, but as an ordinary DOM element: it paints in
+// normal document flow/z-order (so it no longer covers modals) and needs no
+// Rust-side positioning code at all.
+//
+// Known trade-off (accepted): sites sending X-Frame-Options: DENY or a
+// restrictive frame-ancestors CSP (Google, most banks, many login-gated
+// apps) will refuse to load inside this iframe. There is no workaround
+// short of a full embedded browser engine (CEF), which was ruled out as
+// impractical for this app.
 export default function BrowserTabView({ tab, isActive }: { tab: BrowserTab; isActive: boolean }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const openedRef = useRef(false);
-
-  function reportRect() {
-    if (!isActive) return;
-    const el = containerRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
-    const { x, y, width, height } = rect;
-    if (!openedRef.current) {
-      openedRef.current = true;
-      invoke("browser_open", { tabId: tab.id, url: tab.url, x, y, width, height }).catch(() => {});
-    } else {
-      invoke("browser_reposition", { tabId: tab.id, x, y, width, height }).catch(() => {});
-    }
-  }
-
-  // Toggle the native webview's visibility to match whether this tab is the
-  // one currently on screen.
-  useEffect(() => {
-    if (isActive) {
-      reportRect();
-    } else if (openedRef.current) {
-      invoke("browser_hide", { tabId: tab.id }).catch(() => {});
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isActive]);
-
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    // react-resizable-panels can settle into its final pixel size a beat
-    // after the first paint; re-check a few times shortly after becoming
-    // active to catch that late settling, on top of resize-driven reports.
-    const timeouts = [50, 150, 400, 800].map((ms) => setTimeout(reportRect, ms));
-    const observer = new ResizeObserver(() => reportRect());
-    observer.observe(el);
-    window.addEventListener("resize", reportRect);
-    return () => {
-      timeouts.forEach(clearTimeout);
-      observer.disconnect();
-      window.removeEventListener("resize", reportRect);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Only tears down the native webview when this tab is actually closed
-  // (component unmounts because it was removed from the tabs array).
-  useEffect(() => {
-    return () => {
-      invoke("browser_close", { tabId: tab.id }).catch(() => {});
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  return <div ref={containerRef} style={{ display: isActive ? "block" : "none", height: "100%" }} />;
+  return (
+    <iframe
+      src={tab.url}
+      title={tab.title || tab.url}
+      // allow-same-origin + allow-scripts covers normal site behavior
+      // (including most OAuth popups via allow-popups); allow-top-navigation
+      // is deliberately omitted so an embedded page can't navigate the whole
+      // MAHI window away from under the user.
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals"
+      style={{ width: "100%", height: "100%", border: "none", display: isActive ? "block" : "none", background: "#fff" }}
+    />
+  );
 }

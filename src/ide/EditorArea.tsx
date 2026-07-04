@@ -158,50 +158,6 @@ export default function EditorArea({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0, background: "var(--bg-0)" }}>
-      {!browserActive && active && (showModeToggle || showDirToggle) && (
-        <div className="preview-toolbar">
-          {showModeToggle && (
-            <button className="ghost" onClick={toggleMode} title={mode === "rendered" ? t("rawView") : t("renderedView")}>
-              {mode === "rendered" ? <Code size={13} /> : <Eye size={13} />}
-            </button>
-          )}
-          {showDirToggle && (
-            <button className="ghost" onClick={toggleDirection} title={t("toggleDirection")}>
-              <ArrowRightLeft size={13} /> {resolvedDir.toUpperCase()}
-            </button>
-          )}
-        </div>
-      )}
-
-      {/* In windowed (non-fullscreen) mode, Tauri's experimental multiwebview
-          positioning nudges a wide child webview a bit further up than
-          requested (fine in fullscreen, where there's no traffic-light
-          overlay reserving space). This spacer absorbs that nudge so the
-          content lands where it should instead of creeping into the title
-          bar — only reserved for browser tabs, since file previews aren't
-          affected. */}
-      {browserActive && <div style={{ height: 28, flexShrink: 0 }} />}
-
-      <div style={{ flex: 1, minHeight: 0 }}>
-        {!browserActive &&
-          (active ? (
-            body
-          ) : (
-            <div className="welcome">
-              <img src={mahiLogo} alt="MAHI" className="welcome-logo" style={{ width: 84, height: 84 }} />
-              <div className="sub">{t("editorEmpty")}</div>
-            </div>
-          ))}
-        {browserTabs.map((bt) => (
-          <BrowserTabView key={bt.id} tab={bt} isActive={bt.id === activeBrowserId} />
-        ))}
-      </div>
-
-      {/* Tab strip and (when browsing) the address bar live at the bottom,
-          not the top: Tauri's experimental multiwebview positioning can
-          extend a wide child webview upward past its intended top edge,
-          covering whatever sits above it. Nothing important sits above the
-          browser content now. */}
       <div className="tabs">
         {tabs.map((tab, i) => {
           const dirty = isDirty(tab);
@@ -251,6 +207,21 @@ export default function EditorArea({
         </div>
       </div>
 
+      {!browserActive && active && (showModeToggle || showDirToggle) && (
+        <div className="preview-toolbar">
+          {showModeToggle && (
+            <button className="ghost" onClick={toggleMode} title={mode === "rendered" ? t("rawView") : t("renderedView")}>
+              {mode === "rendered" ? <Code size={13} /> : <Eye size={13} />}
+            </button>
+          )}
+          {showDirToggle && (
+            <button className="ghost" onClick={toggleDirection} title={t("toggleDirection")}>
+              <ArrowRightLeft size={13} /> {resolvedDir.toUpperCase()}
+            </button>
+          )}
+        </div>
+      )}
+
       {browserActive && (
         <div className="preview-toolbar" dir="ltr">
           <input
@@ -266,6 +237,21 @@ export default function EditorArea({
           </button>
         </div>
       )}
+
+      <div style={{ flex: 1, minHeight: 0 }}>
+        {!browserActive &&
+          (active ? (
+            body
+          ) : (
+            <div className="welcome">
+              <img src={mahiLogo} alt="MAHI" className="welcome-logo" style={{ width: 84, height: 84 }} />
+              <div className="sub">{t("editorEmpty")}</div>
+            </div>
+          ))}
+        {browserTabs.map((bt) => (
+          <BrowserTabView key={bt.id} tab={bt} isActive={bt.id === activeBrowserId} />
+        ))}
+      </div>
     </div>
   );
 }

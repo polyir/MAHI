@@ -7,6 +7,8 @@ import {
   PROVIDER_ROLES,
   isRoleRoutingEnabled,
   setRoleRoutingEnabled,
+  isBrowserToolsEnabled,
+  setBrowserToolsEnabled,
 } from "./providers";
 import { t, dir as uiDir, useLang, StrKey } from "./i18n";
 
@@ -29,6 +31,7 @@ export default function ProvidersModal({
   useLang();
   const [local, setLocal] = useState<Provider[]>(() => providers.map((p) => ({ ...p })));
   const [routingEnabled, setRoutingEnabled] = useState(isRoleRoutingEnabled());
+  const [browserToolsEnabled, setBrowserToolsEnabledState] = useState(isBrowserToolsEnabled());
 
   function update(i: number, patch: Partial<Provider>) {
     setLocal((cur) => cur.map((p, j) => (j === i ? { ...p, ...patch } : p)));
@@ -121,6 +124,32 @@ export default function ProvidersModal({
           <div>
             <div>{t("roleRoutingLabel")}</div>
             <div style={{ fontSize: 11, opacity: 0.65, marginTop: 2 }}>{t("roleRoutingHelp")}</div>
+          </div>
+        </label>
+
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 12.5,
+            marginBottom: 16,
+            padding: 10,
+            border: "1px solid var(--border-soft)",
+            borderRadius: 10,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={browserToolsEnabled}
+            onChange={(e) => {
+              setBrowserToolsEnabledState(e.target.checked);
+              setBrowserToolsEnabled(e.target.checked);
+            }}
+          />
+          <div>
+            <div>{t("browserToolsLabel")}</div>
+            <div style={{ fontSize: 11, opacity: 0.65, marginTop: 2 }}>{t("browserToolsHelp")}</div>
           </div>
         </label>
 

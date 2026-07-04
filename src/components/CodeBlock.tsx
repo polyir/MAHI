@@ -12,7 +12,7 @@ export default function CodeBlock({ className, children }: { className?: string;
       <SyntaxHighlighter
         language={match[1]}
         style={oneDark}
-        customStyle={{ margin: "6px 0", borderRadius: 8, fontSize: 12.5 }}
+        customStyle={{ margin: "6px 0", borderRadius: 8, fontSize: 12.5, maxWidth: "100%", overflowX: "auto" }}
       >
         {code}
       </SyntaxHighlighter>
