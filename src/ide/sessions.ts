@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import { Msg, Usage, ReasoningEffort, sanitizeEffort } from "../agent";
 import { t } from "./i18n";
 
@@ -35,34 +36,78 @@ export type Session = {
   // Which project (see ./projects.ts) this chat's tool calls operate on —
   // independent of whatever folder happens to be open in the IDE.
   projectId: string;
+  // Local-model-generated summary of messages[0..summaryUpTo), substituted
+  // for those raw messages when building the outgoing API history (see
+  // ChatPanel's outgoingHistory) — the full transcript still renders in the
+  // UI untouched. Undefined/0 means no compaction has happened yet.
+  summary?: string;
+  summaryUpTo?: number;
 };
 
 export const SESSIONS_KEY = "vibe_sessions_v2";
 export const ACTIVE_KEY = "vibe_active_session_v2";
 
+function normalizeSessions(parsed: Session[]): Session[] {
+  return parsed.map((s) => ({
+    ...s,
+    reasoningEffort: sanitizeEffort(s.reasoningEffort),
+    contextBudget: s.contextBudget || 200_000,
+    // Sessions created before projects existed all belonged to the one
+    // implicit project (see projects.ts's back-compat "default" seed).
+    projectId: s.projectId || "default",
+    // Upgrade sessions still on any older default prompt (user hasn't
+    // customized it) to the current default. Custom prompts won't start
+    // with either known prefix, so they are preserved.
+    systemPrompt:
+      !s.systemPrompt ||
+      ((s.systemPrompt.startsWith("You are an expert autonomous coding agent embedded in") ||
+        s.systemPrompt.startsWith("You are an autonomous coding agent embedded in")) &&
+        s.systemPrompt !== DEFAULT_SYSTEM_PROMPT)
+        ? DEFAULT_SYSTEM_PROMPT
+        : s.systemPrompt,
+  }));
+}
+
+// Synchronous localStorage read — kept only as the one-time migration
+// source for the first launch after switching to file-backed storage (see
+// loadSessionsFromFile below), and as the instant-paint value before that
+// migration effect resolves. Never written to again after migration.
 export function loadSessions(): Session[] {
   try {
     const parsed: Session[] = JSON.parse(localStorage.getItem(SESSIONS_KEY) ?? "[]");
-    return parsed.map((s) => ({
-      ...s,
-      reasoningEffort: sanitizeEffort(s.reasoningEffort),
-      contextBudget: s.contextBudget || 200_000,
-      // Sessions created before projects existed all belonged to the one
-      // implicit project (see projects.ts's back-compat "default" seed).
-      projectId: s.projectId || "default",
-      // Upgrade sessions still on any older default prompt (user hasn't
-      // customized it) to the current default. Custom prompts won't start
-      // with either known prefix, so they are preserved.
-      systemPrompt:
-        !s.systemPrompt ||
-        ((s.systemPrompt.startsWith("You are an expert autonomous coding agent embedded in") ||
-          s.systemPrompt.startsWith("You are an autonomous coding agent embedded in")) &&
-          s.systemPrompt !== DEFAULT_SYSTEM_PROMPT)
-          ? DEFAULT_SYSTEM_PROMPT
-          : s.systemPrompt,
-    }));
+    return normalizeSessions(parsed);
   } catch {
     return [];
+  }
+}
+
+// Chat history used to be persisted entirely in localStorage, which has a
+// ~5MB per-origin quota in WebKit. Long conversations eventually filled that
+// quota, which silently broke every OTHER localStorage-backed setting in
+// the app too (a new key's setItem throws QuotaExceededError once the quota
+// is already exhausted, with no try/catch around most of those call sites) —
+// confirmed via a debug probe during a settings-persistence bug report.
+// Sessions now live in a plain JSON file (src-tauri/src/sessions.rs)
+// instead, which has no such ceiling.
+export async function loadSessionsFromFile(): Promise<Session[] | null> {
+  try {
+    const json = await invoke<string | null>("sessions_load");
+    if (!json) return null;
+    return normalizeSessions(JSON.parse(json));
+  } catch {
+    return null;
+  }
+}
+
+// Resolves true only once the write actually lands on disk — callers use
+// this to gate clearing the old localStorage copy, so a failed file write
+// (disk full, permissions) never leaves history with no backup at all.
+export async function saveSessionsToFile(sessions: Session[]): Promise<boolean> {
+  try {
+    await invoke("sessions_save", { json: JSON.stringify(sessions) });
+    return true;
+  } catch {
+    return false;
   }
 }
 

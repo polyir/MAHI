@@ -1,12 +1,22 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::State;
 
-/// Snapshot of one file before a mutation: its previous content, or None if
-/// the file did not exist yet (revert then deletes it).
-type Snapshot = (String, Option<String>);
+#[derive(Clone)]
+enum SnapshotContent {
+    Missing,
+    File(Vec<u8>),
+    Dir {
+        dirs: Vec<PathBuf>,
+        files: Vec<(PathBuf, Vec<u8>)>,
+    },
+}
+
+/// Snapshot of one path before a mutation.
+type Snapshot = (String, SnapshotContent);
 
 #[derive(Default)]
 pub struct CheckpointManager {
@@ -31,7 +41,8 @@ pub fn checkpoint_record(
     path: String,
 ) -> Result<(), String> {
     let abs = crate::resolve(&workspace, &path)?;
-    let content = fs::read_to_string(&abs).ok();
+    crate::ensure_not_workspace_root(&workspace, &abs)?;
+    let content = snapshot_path(&abs)?;
     let mut groups = state.groups.lock().unwrap();
     let group = groups.get_mut(&id).ok_or("unknown checkpoint id")?;
     if !group.iter().any(|(p, _)| p == &path) {
@@ -57,17 +68,80 @@ pub fn checkpoint_revert(
     for (path, content) in snapshots.iter().rev() {
         let abs = crate::resolve(&workspace, path)?;
         match content {
-            Some(c) => {
+            SnapshotContent::File(c) => {
+                remove_existing(&abs)?;
                 if let Some(parent) = abs.parent() {
                     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 fs::write(&abs, c).map_err(|e| e.to_string())?;
             }
-            None => {
-                let _ = fs::remove_file(&abs);
+            SnapshotContent::Dir { dirs, files } => {
+                remove_existing(&abs)?;
+                fs::create_dir_all(&abs).map_err(|e| e.to_string())?;
+                for dir in dirs {
+                    fs::create_dir_all(abs.join(dir)).map_err(|e| e.to_string())?;
+                }
+                for (rel, bytes) in files {
+                    let dest = abs.join(rel);
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    fs::write(dest, bytes).map_err(|e| e.to_string())?;
+                }
+            }
+            SnapshotContent::Missing => {
+                remove_existing(&abs)?;
             }
         }
         restored.push(path.clone());
     }
     Ok(restored)
+}
+
+fn snapshot_path(abs: &Path) -> Result<SnapshotContent, String> {
+    if !abs.exists() {
+        return Ok(SnapshotContent::Missing);
+    }
+    if abs.is_dir() {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        collect_dir(abs, abs, &mut dirs, &mut files)?;
+        return Ok(SnapshotContent::Dir { dirs, files });
+    }
+    Ok(SnapshotContent::File(
+        fs::read(abs).map_err(|e| e.to_string())?,
+    ))
+}
+
+fn collect_dir(
+    root: &Path,
+    dir: &Path,
+    dirs: &mut Vec<PathBuf>,
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|e| e.to_string())?
+            .to_path_buf();
+        if file_type.is_dir() {
+            dirs.push(rel);
+            collect_dir(root, &path, dirs, files)?;
+        } else if file_type.is_file() {
+            files.push((rel, fs::read(&path).map_err(|e| e.to_string())?));
+        }
+    }
+    Ok(())
+}
+
+fn remove_existing(path: &Path) -> Result<(), String> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(|e| e.to_string())?;
+    } else if path.exists() {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }

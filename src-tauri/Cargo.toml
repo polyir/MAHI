@@ -32,4 +32,14 @@ tauri-plugin-notification = "2"
 base64 = "0.22"
 xcap = "0.9.6"
 image = "0.25"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+futures-util = "0.3"
+whisper-rs = { version = "0.16", features = ["metal"] }
+sherpa-rs = { version = "0.6", features = ["tts"] }
+hound = "3"
+notify = "8"
+notify-debouncer-mini = "0.7"
+libc = "0.2"
+tokio = { version = "1", features = ["rt", "time", "process"] }
 

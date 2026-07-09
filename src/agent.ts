@@ -4,6 +4,9 @@ import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { reportRateLimitReset } from "./ide/limits";
 import { t } from "./ide/i18n";
 import { Provider, ProviderRole, findProviderForRole, isBrowserToolsEnabled } from "./ide/providers";
+import { loadActiveAsrModel, loadTtsBackend, loadVoiceForLang } from "./ide/models";
+import { getLang } from "./ide/i18n";
+import { synthesizeElevenLabs } from "./ide/elevenlabs";
 
 export type ToolCall = {
   id: string;
@@ -60,6 +63,7 @@ export const SENSITIVE_TOOLS = new Set([
   "generate_video",
   "browser_navigate",
   "browser_close",
+  "speak_text",
 ]);
 
 // Embedded-browser tools are handled by a separate dispatch path (they don't
@@ -74,12 +78,7 @@ const BROWSER_TOOL_NAMES = new Set([
 ]);
 
 // File-mutating tools snapshot the previous state into the turn's checkpoint
-// so the user can revert the whole turn. Media-generation tools are
-// deliberately NOT included: checkpoint_record reads the "before" content as
-// UTF-8 text, so on a binary file it silently records "did not exist" and a
-// revert would DELETE the file instead of restoring its bytes. Until
-// checkpoint.rs gets a binary-safe snapshot, generated media is excluded
-// from turn-revert rather than risk destroying it.
+// so the user can revert the whole turn.
 const CHECKPOINTED_TOOLS = new Set(["write_file", "edit_file", "delete_file", "move_file"]);
 
 // Tool name -> which provider role should serve it, when role routing is on.
@@ -270,6 +269,85 @@ const tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   },
 ];
 
+// Always available (no settings flag, no approval) — passive/view-only
+// capabilities distinct from the browser-control toggle: opening a file tab
+// or looking at the whole window isn't "controlling the browser," it's just
+// letting the agent see what the user sees in the IDE's own preview panel.
+// A function rather than a static array so speak_text's description can
+// reflect whichever TTS backend is currently configured (Settings → Local
+// AI Models) — it changed at runtime after ElevenLabs was added as an
+// alternative to the local voices, and the model needs to know which output
+// format/extension it's actually going to get.
+function alwaysOnTools(): OpenAI.Chat.Completions.ChatCompletionTool[] {
+  const usingElevenLabs = loadTtsBackend() === "elevenlabs";
+  return [
+  {
+    type: "function",
+    function: {
+      name: "open_file_in_editor",
+      description:
+        "Open a file as a new tab in the IDE's own editor/preview panel, so the user can see it (works for text, images, PDF, audio, video — whatever the panel can preview). Only works when this chat's project is the same folder currently open in the IDE; otherwise returns an error.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          line: { type: "number", description: "optional line to scroll to, for text files" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "view_screen",
+      description:
+        "Take a screenshot of the whole MAHI window as it currently looks — useful to see what's in the editor/preview panel (an image, PDF, rendered markdown, a file the user has open) or an embedded browser tab. View-only: you will NOT receive the image back (no vision input); it's shown to the user in this tool's card.",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "transcribe_media",
+      description:
+        "Transcribe speech from a local audio or video file using the installed local Whisper model (fully offline, no cloud provider). Requires a model to be downloaded first (Settings → Local AI Models); if none is installed, returns a clear error saying so. Returns plain text and timestamped segments.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          language: { type: "string", description: "optional ISO 639-1 code, e.g. 'fa', 'en' — omit to auto-detect" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "speak_text",
+      description: usingElevenLabs
+        ? "Synthesize speech from text via the configured ElevenLabs voice (cloud) and save it as an MP3 file into the workspace — use a .mp3 path. Requires an ElevenLabs API key and voice ID to be configured (Settings → Local AI Models); if missing, returns a clear error saying so."
+        : "Synthesize speech from text using a downloaded local voice (fully offline, no cloud provider) and save it as a WAV file into the workspace — use a .wav path. Requires a voice to be installed for the target language (Settings → Local AI Models); if none is installed, returns a clear error saying so.",
+      parameters: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          path: { type: "string" },
+          voice_id: {
+            type: "string",
+            description: usingElevenLabs
+              ? "ignored — ElevenLabs uses the single voice ID configured in Settings"
+              : "optional — omit to use the default voice for the current UI language",
+          },
+        },
+        required: ["text", "path"],
+      },
+    },
+  },
+  ];
+}
+
 // Only appended to the request when isBrowserToolsEnabled() is on (Settings
 // → Providers). There is no browser_read/click/type: the embedded browser is
 // a plain iframe, and cross-origin iframe content is invisible to the parent
@@ -347,7 +425,7 @@ async function runTool(
       const paths: string[] =
         name === "move_file" ? [args.from, args.to] : args.path ? [args.path] : [];
       for (const p of paths) {
-        await invoke("checkpoint_record", { workspace, id: checkpointId, path: p }).catch(() => {});
+        await recordCheckpoint(workspace, checkpointId, p);
       }
     }
     switch (name) {
@@ -418,6 +496,11 @@ async function runTool(
   }
 }
 
+async function recordCheckpoint(workspace: string, checkpointId: number | undefined, path?: string) {
+  if (checkpointId === undefined || !path) return;
+  await invoke("checkpoint_record", { workspace, id: checkpointId, path }).catch(() => {});
+}
+
 export function makeClient(apiKey: string, baseURL = "https://api.sakana.ai/v1") {
   return new OpenAI({
     apiKey,
@@ -433,7 +516,13 @@ export function makeClient(apiKey: string, baseURL = "https://api.sakana.ai/v1")
 /// Media-generation tools run against whichever provider owns that role
 /// (see findProviderForRole), which may differ from the chat provider —
 /// so they build their own short-lived client rather than reusing runTool's.
-async function runMediaTool(provider: Provider, workspace: string, name: string, args: any): Promise<string> {
+async function runMediaTool(
+  provider: Provider,
+  workspace: string,
+  name: string,
+  args: any,
+  checkpointId?: number
+): Promise<string> {
   try {
     const client = makeClient(provider.apiKey, provider.baseURL);
     if (name === "generate_image") {
@@ -446,6 +535,7 @@ async function runMediaTool(provider: Provider, workspace: string, name: string,
       } as any);
       const b64 = (resp.data?.[0] as any)?.b64_json;
       if (!b64) return "error: provider did not return image data (it may not support image generation)";
+      await recordCheckpoint(workspace, checkpointId, args.path);
       await invoke("write_file_binary", { workspace, path: args.path, base64Content: b64 });
       return `ok: image saved to ${args.path} (via provider "${provider.name}")`;
     }
@@ -460,6 +550,7 @@ async function runMediaTool(provider: Provider, workspace: string, name: string,
       let binary = "";
       for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
       const b64 = btoa(binary);
+      await recordCheckpoint(workspace, checkpointId, args.path);
       await invoke("write_file_binary", { workspace, path: args.path, base64Content: b64 });
       return `ok: audio saved to ${args.path} (via provider "${provider.name}")`;
     }
@@ -555,6 +646,10 @@ export type AgentOptions = {
   // the tool call's id — see runBrowserTool's comment for why this must stay
   // out of the persisted Msg/history instead of being returned as text.
   onScreenshot?: (toolCallId: string, base64: string) => void;
+  // Backs open_file_in_editor. Undefined (rather than a no-op) when this
+  // chat's project isn't the folder open in the IDE, so the tool can return
+  // a clear error instead of silently doing nothing.
+  openFile?: (path: string, line?: number) => void;
 };
 
 function isRetryable(e: any): boolean {
@@ -771,7 +866,9 @@ export async function agentTurn(
   // for the whole content again (in every subsequent call of the turn).
   const readSeen = new Map<string, string>();
   const budget = opts.contextBudget ?? 200_000;
-  const activeTools = isBrowserToolsEnabled() ? [...tools, ...BROWSER_TOOLS] : tools;
+  const activeTools = isBrowserToolsEnabled()
+    ? [...tools, ...alwaysOnTools(), ...BROWSER_TOOLS]
+    : [...tools, ...alwaysOnTools()];
 
   // Each iteration is a full re-bill of the conversation, so the cap is the
   // last defense against runaway spend. If a legit big task hits it, the
@@ -924,7 +1021,67 @@ export async function agentTurn(
       }
 
       let result: string;
-      if (call.function.name in MEDIA_TOOLS) {
+      if (call.function.name === "open_file_in_editor") {
+        if (!opts.openFile) {
+          result = "error: this chat's project isn't the folder currently open in the IDE, so there's no tab strip to open it in.";
+        } else {
+          opts.openFile(args.path, args.line);
+          result = `ok: opened ${args.path} in the IDE editor`;
+        }
+      } else if (call.function.name === "view_screen") {
+        if (!opts.browserControl) {
+          result = "error: screen capture is not available right now";
+        } else {
+          const b64 = await opts.browserControl.screenshot();
+          opts.onScreenshot?.(call.id, b64);
+          result = "ok: screenshot captured (shown to the user in this tool card — you cannot see it yourself)";
+        }
+      } else if (call.function.name === "transcribe_media") {
+        const modelId = loadActiveAsrModel();
+        if (!modelId) {
+          result = "error: no local Whisper model installed — open Settings → Local AI Models to download one";
+        } else {
+          try {
+            const r = await invoke("transcribe_media", {
+              workspace,
+              path: args.path,
+              modelId,
+              language: args.language,
+            });
+            result = JSON.stringify(r);
+          } catch (e) {
+            result = `error: ${String(e)}`;
+          }
+        }
+      } else if (call.function.name === "speak_text") {
+        const ttsBackend = loadTtsBackend();
+        const voiceId = args.voice_id || loadVoiceForLang(getLang());
+        if (ttsBackend === "local" && !voiceId) {
+          result = "error: no local voice installed for the current language — open Settings → Local AI Models to download one";
+        } else {
+          const approved = await opts.requestApproval(call.function.name, args);
+          if (!approved) {
+            result = "Rejected by user. Do not retry this exact action without asking.";
+          } else {
+            try {
+              await recordCheckpoint(workspace, opts.checkpointId, args.path);
+              if (ttsBackend === "elevenlabs") {
+                await synthesizeElevenLabs(workspace, args.text, args.path);
+              } else {
+                await invoke("synthesize_speech", {
+                  workspace,
+                  text: args.text,
+                  voiceId,
+                  outPath: args.path,
+                });
+              }
+              result = `ok: speech saved to ${args.path}`;
+            } catch (e) {
+              result = `error: ${String(e)}`;
+            }
+          }
+        }
+      } else if (call.function.name in MEDIA_TOOLS) {
         const approved = await opts.requestApproval(call.function.name, args);
         if (!approved) {
           result = "Rejected by user. Do not retry this exact action without asking.";
@@ -933,7 +1090,7 @@ export async function agentTurn(
         } else {
           const role = MEDIA_TOOLS[call.function.name];
           const roleProvider = findProviderForRole(opts.allProviders ?? [], role, opts.chatProvider);
-          result = await runMediaTool(roleProvider, workspace, call.function.name, args);
+          result = await runMediaTool(roleProvider, workspace, call.function.name, args, opts.checkpointId);
         }
       } else if (BROWSER_TOOL_NAMES.has(call.function.name)) {
         const onScreenshot = opts.onScreenshot ? (b64: string) => opts.onScreenshot!(call.id, b64) : undefined;

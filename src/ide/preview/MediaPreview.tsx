@@ -10,13 +10,16 @@ export default function MediaPreview({
   workspace,
   path,
   kind,
+  cacheBust,
 }: {
   workspace: string;
   path: string;
   kind: "audio" | "video";
+  cacheBust?: number;
 }) {
   const [error, setError] = useState(false);
-  const src = convertFileSrc(absolutePath(workspace, path));
+  const base = convertFileSrc(absolutePath(workspace, path));
+  const src = cacheBust ? `${base}?v=${cacheBust}` : base;
 
   if (error) {
     return <div style={{ padding: 14, fontSize: 12.5, opacity: 0.6 }}>{t("openError")}</div>;

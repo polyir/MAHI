@@ -1,17 +1,24 @@
+mod asr;
 mod checkpoint;
+mod external_tools;
+mod llm;
 mod media;
+mod models;
 mod pty;
 mod screenshot;
+mod sessions;
+mod tts;
+mod watcher;
 
 use regex::Regex;
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::{Component, Path, PathBuf};
+use tokio::process::Command;
 
 const IGNORED_DIRS: [&str; 5] = [".git", "node_modules", "target", "dist", ".next"];
 
-fn is_ignored(name: &str) -> bool {
+pub(crate) fn is_ignored(name: &str) -> bool {
     name.starts_with('.') && name != "." || IGNORED_DIRS.contains(&name)
 }
 
@@ -74,16 +81,58 @@ pub(crate) fn resolve(workspace: &str, rel: &str) -> Result<PathBuf, String> {
     let base = Path::new(workspace)
         .canonicalize()
         .map_err(|e| format!("invalid workspace: {e}"))?;
-    let candidate = base.join(rel);
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute() {
+        return Err("path escapes workspace".into());
+    }
+    let mut clean_rel = PathBuf::new();
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(part) => clean_rel.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !clean_rel.pop() {
+                    return Err("path escapes workspace".into());
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("path escapes workspace".into())
+            }
+        }
+    }
+    let candidate = base.join(clean_rel);
     let candidate = if candidate.exists() {
         candidate.canonicalize().map_err(|e| e.to_string())?
     } else {
+        let mut ancestor = candidate.parent().unwrap_or(&base);
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().unwrap_or(&base);
+        }
+        let ancestor = ancestor.canonicalize().map_err(|e| e.to_string())?;
+        if !ancestor.starts_with(&base) {
+            return Err("path escapes workspace".into());
+        }
         candidate
     };
     if !candidate.starts_with(&base) {
         return Err("path escapes workspace".into());
     }
     Ok(candidate)
+}
+
+pub(crate) fn ensure_not_workspace_root(workspace: &str, path: &Path) -> Result<(), String> {
+    let base = Path::new(workspace)
+        .canonicalize()
+        .map_err(|e| format!("invalid workspace: {e}"))?;
+    let candidate = if path.exists() {
+        path.canonicalize().map_err(|e| e.to_string())?
+    } else {
+        path.to_path_buf()
+    };
+    if candidate == base {
+        return Err("refusing to mutate workspace root".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -108,6 +157,7 @@ fn register_asset_scope(app: tauri::AppHandle, workspace: String) -> Result<(), 
 #[tauri::command]
 fn write_file(workspace: String, path: String, content: String) -> Result<(), String> {
     let p = resolve(&workspace, &path)?;
+    ensure_not_workspace_root(&workspace, &p)?;
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -166,6 +216,7 @@ fn list_dir(workspace: String, path: String) -> Result<Vec<Entry>, String> {
 #[tauri::command]
 fn delete_file(workspace: String, path: String) -> Result<(), String> {
     let p = resolve(&workspace, &path)?;
+    ensure_not_workspace_root(&workspace, &p)?;
     if p.is_dir() {
         fs::remove_dir_all(p).map_err(|e| e.to_string())
     } else {
@@ -177,6 +228,8 @@ fn delete_file(workspace: String, path: String) -> Result<(), String> {
 fn move_file(workspace: String, from: String, to: String) -> Result<(), String> {
     let src = resolve(&workspace, &from)?;
     let dst = resolve(&workspace, &to)?;
+    ensure_not_workspace_root(&workspace, &src)?;
+    ensure_not_workspace_root(&workspace, &dst)?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -190,8 +243,13 @@ struct CmdOutput {
     code: i32,
 }
 
+// async: this used to run std::process::Command::output() synchronously,
+// which blocks the same runtime that services the native window's event
+// loop — a long shell command (a deploy, a build) froze the whole macOS UI
+// (spinning beachball) for its entire duration. tokio::process::Command's
+// awaited output() keeps that thread free to service the UI meanwhile.
 #[tauri::command]
-fn run_command(workspace: String, cmd: String) -> Result<CmdOutput, String> {
+async fn run_command(workspace: String, cmd: String) -> Result<CmdOutput, String> {
     let base = Path::new(&workspace)
         .canonicalize()
         .map_err(|e| format!("invalid workspace: {e}"))?;
@@ -200,6 +258,7 @@ fn run_command(workspace: String, cmd: String) -> Result<CmdOutput, String> {
         .arg(&cmd)
         .current_dir(&base)
         .output()
+        .await
         .map_err(|e| e.to_string())?;
     Ok(CmdOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -329,24 +388,39 @@ fn project_tree(workspace: String, max_entries: Option<usize>) -> Result<String,
 /// once and can check real usage anytime. Host-allowlisted so arbitrary URLs
 /// can't be opened through this command.
 #[tauri::command]
-async fn open_console_window(app: tauri::AppHandle, url: String, title: String) -> Result<(), String> {
+async fn open_console_window(
+    app: tauri::AppHandle,
+    url: String,
+    title: String,
+) -> Result<(), String> {
     use tauri::Manager;
     let parsed: tauri::Url = url.parse().map_err(|e| format!("invalid url: {e}"))?;
     let host = parsed.host_str().unwrap_or_default();
-    const ALLOWED: [&str; 4] = ["console.sakana.ai", "sakana.ai", "z.ai", "console.z.ai"];
-    if parsed.scheme() != "https" || !ALLOWED.iter().any(|h| host == *h || host.ends_with(&format!(".{h}"))) {
+    const ALLOWED: [&str; 5] = ["console.sakana.ai", "sakana.ai", "z.ai", "console.z.ai", "github.com"];
+    if parsed.scheme() != "https"
+        || !ALLOWED
+            .iter()
+            .any(|h| host == *h || host.ends_with(&format!(".{h}")))
+    {
         return Err(format!("host not allowed: {host}"));
     }
     if let Some(w) = app.get_webview_window("provider-console") {
-        let _ = w.eval(&format!("window.location.replace({})", serde_json::to_string(&url).unwrap()));
+        let _ = w.eval(format!(
+            "window.location.replace({})",
+            serde_json::to_string(&url).unwrap()
+        ));
         let _ = w.set_focus();
         return Ok(());
     }
-    tauri::WebviewWindowBuilder::new(&app, "provider-console", tauri::WebviewUrl::External(parsed))
-        .title(&title)
-        .inner_size(1050.0, 780.0)
-        .build()
-        .map_err(|e| e.to_string())?;
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "provider-console",
+        tauri::WebviewUrl::External(parsed),
+    )
+    .title(&title)
+    .inner_size(1050.0, 780.0)
+    .build()
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -361,6 +435,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(pty::PtyManager::default())
         .manage(checkpoint::CheckpointManager::default())
+        .manage(models::ModelManager::default())
+        .manage(asr::AsrManager::default())
+        .manage(tts::TtsManager::default())
+        .manage(watcher::WatcherManager::default())
+        .manage(llm::LlamaManager::default())
         .invoke_handler(tauri::generate_handler![
             read_file,
             register_asset_scope,
@@ -382,8 +461,31 @@ pub fn run() {
             checkpoint::checkpoint_begin,
             checkpoint::checkpoint_record,
             checkpoint::checkpoint_revert,
+            models::model_download,
+            models::model_list_status,
+            models::model_delete,
+            asr::transcribe_media,
+            tts::synthesize_speech,
+            watcher::watch_workspace,
+            llm::local_llm_ensure,
+            llm::local_llm_stop,
+            sessions::sessions_load,
+            sessions::sessions_save,
+            external_tools::external_tools_list,
+            external_tools::external_tool_status,
+            external_tools::external_tool_install,
             open_console_window
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Without this, a llama-server sidecar spawned by local_llm_ensure
+            // would keep running after MAHI itself quits — it has no parent
+            // check of its own, so it'd sit there holding RAM/the port
+            // forever until manually killed.
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                llm::kill_all(app.state::<llm::LlamaManager>().inner());
+            }
+        });
 }

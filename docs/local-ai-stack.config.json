@@ -1,0 +1,500 @@
+{
+  "schema_version": "1.0.0",
+  "project": {
+    "name": "agentic_ide_multilingual_ai_stack",
+    "purpose": "local-first multilingual OCR, ASR and TTS stack for an agentic IDE",
+    "target_languages": ["fa-IR", "tr-TR", "en-US", "ru-RU", "zh-CN", "ja-JP"],
+    "design_policy": {
+      "prefer_local_models": true,
+      "prefer_open_weights": true,
+      "prefer_per_language_routing_over_single_universal_model": true,
+      "allow_cloud_fallback": false,
+      "notes": [
+        "Use a router instead of forcing one model to handle every language and task.",
+        "Keep OCR, ASR and TTS as separate services so the IDE can scale or disable each module independently.",
+        "Cache model outputs aggressively for repeated prompts, screenshots, commands and voice responses."
+      ]
+    }
+  },
+  "languages": {
+    "fa-IR": {
+      "label": "Persian",
+      "script": "Arabic",
+      "direction": "rtl",
+      "whisper_language": "fa",
+      "ocr_primary_lang": "fa",
+      "ocr_script_model": "arabic_PP-OCRv5_mobile_rec",
+      "ocr_fallback_langs": {
+        "easyocr": ["fa", "en"],
+        "tesseract": ["fas", "eng"]
+      },
+      "tts_primary_voice": "fa_IR_mana_medium",
+      "normalization_required": true
+    },
+    "tr-TR": {
+      "label": "Turkish",
+      "script": "Latin",
+      "direction": "ltr",
+      "whisper_language": "tr",
+      "ocr_primary_lang": "tr",
+      "ocr_script_model": "latin_PP-OCRv5_mobile_rec",
+      "ocr_fallback_langs": {
+        "easyocr": ["tr", "en"],
+        "tesseract": ["tur", "eng"]
+      },
+      "tts_primary_voice": "tr_TR_piper_or_sherpa_vits",
+      "normalization_required": true
+    },
+    "en-US": {
+      "label": "English",
+      "script": "Latin",
+      "direction": "ltr",
+      "whisper_language": "en",
+      "ocr_primary_lang": "en",
+      "ocr_script_model": "en_PP-OCRv5_mobile_rec",
+      "ocr_fallback_langs": {
+        "easyocr": ["en"],
+        "tesseract": ["eng"]
+      },
+      "tts_primary_voice": "en_US_lessac_or_ryan",
+      "normalization_required": true
+    },
+    "ru-RU": {
+      "label": "Russian",
+      "script": "Cyrillic",
+      "direction": "ltr",
+      "whisper_language": "ru",
+      "ocr_primary_lang": "ru",
+      "ocr_script_model": "cyrillic_PP-OCRv5_mobile_rec",
+      "ocr_fallback_langs": {
+        "easyocr": ["ru", "en"],
+        "tesseract": ["rus", "eng"]
+      },
+      "tts_primary_voice": "ru_RU_piper_or_sherpa_vits",
+      "normalization_required": true
+    },
+    "zh-CN": {
+      "label": "Chinese Simplified",
+      "script": "Han",
+      "direction": "ltr",
+      "whisper_language": "zh",
+      "ocr_primary_lang": "ch",
+      "ocr_script_model": "PP-OCRv5_default_ch_en_japan",
+      "ocr_fallback_langs": {
+        "easyocr": ["ch_sim", "en"],
+        "tesseract": ["chi_sim", "eng"]
+      },
+      "tts_primary_voice": "zh_CN_sherpa_onnx_vits_or_kokoro",
+      "normalization_required": true
+    },
+    "ja-JP": {
+      "label": "Japanese",
+      "script": "Japanese",
+      "direction": "ltr",
+      "whisper_language": "ja",
+      "ocr_primary_lang": "japan",
+      "ocr_script_model": "PP-OCRv5_default_ch_en_japan",
+      "ocr_fallback_langs": {
+        "easyocr": ["ja", "en"],
+        "tesseract": ["jpn", "eng"]
+      },
+      "tts_primary_voice": "ja_JP_sherpa_onnx_or_kokoro",
+      "normalization_required": true
+    }
+  },
+  "modules": {
+    "asr": {
+      "enabled": true,
+      "role": "speech_to_text_for_commands_dictation_meetings_and_audio_files",
+      "primary": {
+        "engine": "faster-whisper",
+        "runtime": "CTranslate2",
+        "model_id": "h2oai/faster-whisper-large-v3-turbo",
+        "base_model_id": "openai/whisper-large-v3-turbo",
+        "license": "MIT",
+        "tasks": ["transcribe", "translate_to_english"],
+        "supported_languages": ["fa", "tr", "en", "ru", "zh", "ja"],
+        "recommended_compute": {
+          "apple_silicon": {
+            "compute_type": "int8_float16",
+            "device": "auto",
+            "notes": "Good balance for MacBook with limited RAM."
+          },
+          "cuda": {
+            "compute_type": "float16",
+            "device": "cuda",
+            "notes": "Best option if a real GPU exists, not a decorative toaster."
+          },
+          "cpu_only": {
+            "compute_type": "int8",
+            "device": "cpu",
+            "notes": "Usable for background transcription, not ideal for live UX."
+          }
+        },
+        "default_options": {
+          "beam_size": 5,
+          "vad_filter": true,
+          "word_timestamps": true,
+          "condition_on_previous_text": false,
+          "temperature": [0.0, 0.2, 0.4, 0.6, 0.8],
+          "compression_ratio_threshold": 1.35,
+          "log_prob_threshold": -1.0,
+          "no_speech_threshold": 0.6
+        },
+        "routing_rules": [
+          {
+            "case": "known_language",
+            "action": "pass_language_code_explicitly"
+          },
+          {
+            "case": "unknown_language",
+            "action": "detect_language_first_then_transcribe"
+          },
+          {
+            "case": "long_audio",
+            "action": "chunk_audio_with_vad_and_merge_segments"
+          }
+        ]
+      },
+      "fallback": {
+        "engine": "transformers",
+        "model_id": "openai/whisper-large-v3-turbo",
+        "use_when": ["debugging", "model_conversion_failure", "quality_comparison"]
+      }
+    },
+    "ocr": {
+      "enabled": true,
+      "role": "screen_understanding_document_parsing_code_screenshot_reading_ui_agent_vision",
+      "primary_fast": {
+        "engine": "PaddleOCR",
+        "family": "PP-OCRv5",
+        "use_for": [
+          "screenshots",
+          "browser_pages",
+          "terminal_screens",
+          "IDE_panels",
+          "simple_images",
+          "forms_with_light_layout"
+        ],
+        "detection_model": "PP-OCRv5_server_det_or_mobile_det",
+        "recognition_models": {
+          "fa-IR": "arabic_PP-OCRv5_mobile_rec",
+          "tr-TR": "latin_PP-OCRv5_mobile_rec",
+          "en-US": "en_PP-OCRv5_mobile_rec",
+          "ru-RU": "cyrillic_PP-OCRv5_mobile_rec",
+          "zh-CN": "PP-OCRv5_default_ch_en_japan",
+          "ja-JP": "PP-OCRv5_default_ch_en_japan"
+        },
+        "output_format": {
+          "text": true,
+          "boxes": true,
+          "confidence": true,
+          "reading_order": true,
+          "language_hint": true
+        },
+        "preprocessing": {
+          "deskew": true,
+          "denoise": true,
+          "upscale_small_text": true,
+          "binarize_low_contrast": true,
+          "preserve_original_image": true
+        }
+      },
+      "primary_document": {
+        "engine": "PaddleOCR-VL",
+        "use_for": [
+          "pdf_pages",
+          "tables",
+          "charts",
+          "multi_column_documents",
+          "academic_papers",
+          "structured_document_parsing"
+        ],
+        "load_policy": "lazy",
+        "notes": [
+          "Use this only when layout understanding matters.",
+          "Do not keep it always loaded in a desktop IDE unless you enjoy wasting RAM as a lifestyle choice."
+        ],
+        "output_format": {
+          "markdown": true,
+          "layout_blocks": true,
+          "tables": true,
+          "figures": true,
+          "reading_order": true
+        }
+      },
+      "fallbacks": [
+        {
+          "engine": "EasyOCR",
+          "use_for": ["quick_fallback", "mixed_language_images", "when_paddleocr_fails"],
+          "languages": {
+            "fa-IR": ["fa", "en"],
+            "tr-TR": ["tr", "en"],
+            "en-US": ["en"],
+            "ru-RU": ["ru", "en"],
+            "zh-CN": ["ch_sim", "en"],
+            "ja-JP": ["ja", "en"]
+          },
+          "priority": 2
+        },
+        {
+          "engine": "Tesseract",
+          "use_for": ["very_lightweight_fallback", "offline_minimal_install", "simple_printed_documents"],
+          "languages": {
+            "fa-IR": ["fas", "eng"],
+            "tr-TR": ["tur", "eng"],
+            "en-US": ["eng"],
+            "ru-RU": ["rus", "eng"],
+            "zh-CN": ["chi_sim", "eng"],
+            "ja-JP": ["jpn", "eng"]
+          },
+          "priority": 3
+        },
+        {
+          "engine": "Surya OCR",
+          "use_for": ["layout_heavy_documents", "table_detection", "reading_order_recovery"],
+          "load_policy": "optional_lazy",
+          "priority": 4
+        }
+      ],
+      "routing_rules": [
+        {
+          "input_type": "screenshot_or_ui",
+          "engine": "PaddleOCR_PP-OCRv5_fast"
+        },
+        {
+          "input_type": "pdf_or_scanned_document",
+          "engine": "PaddleOCR-VL"
+        },
+        {
+          "input_type": "terminal_or_code_screenshot",
+          "engine": "PaddleOCR_PP-OCRv5_fast",
+          "postprocess": ["preserve_indentation", "preserve_symbols", "avoid_autocorrection"]
+        },
+        {
+          "input_type": "mixed_fa_en",
+          "engine": "PaddleOCR_PP-OCRv5_fast",
+          "recognizers": ["arabic_PP-OCRv5_mobile_rec", "en_PP-OCRv5_mobile_rec"]
+        },
+        {
+          "input_type": "mixed_zh_ja_en",
+          "engine": "PaddleOCR_PP-OCRv5_fast",
+          "recognizers": ["PP-OCRv5_default_ch_en_japan", "en_PP-OCRv5_mobile_rec"]
+        }
+      ]
+    },
+    "tts": {
+      "enabled": true,
+      "role": "local_voice_responses_for_agentic_ide",
+      "architecture": "language_router_with_small_per_language_models",
+      "primary_engine": "sherpa-onnx_or_piper",
+      "voices": {
+        "fa-IR": {
+          "engine": "piper",
+          "model_id": "MahtaFetrat/Mana-Persian-Piper",
+          "model_file": "fa_IR-mana-medium.onnx",
+          "config_file": "fa_IR-mana-medium.onnx.json",
+          "license": "MIT",
+          "fallback_model_id": "SadeghK/persian-text-to-speech"
+        },
+        "tr-TR": {
+          "engine": "piper_or_sherpa_onnx",
+          "model_id": "rhasspy/piper-voices_or_sherpa_onnx_tts_models",
+          "voice_quality": "medium_or_high"
+        },
+        "en-US": {
+          "engine": "piper_or_kokoro",
+          "model_id": "rhasspy/piper-voices",
+          "recommended_voices": ["en_US-lessac-medium", "en_US-ryan-medium"]
+        },
+        "ru-RU": {
+          "engine": "piper_or_sherpa_onnx",
+          "model_id": "rhasspy/piper-voices_or_sherpa_onnx_tts_models"
+        },
+        "zh-CN": {
+          "engine": "sherpa-onnx",
+          "model_id": "sherpa-onnx-vits-zh_or_kokoro_multi_lang",
+          "notes": "Prefer a native Chinese model over forcing a generic multilingual TTS."
+        },
+        "ja-JP": {
+          "engine": "kokoro_or_sherpa_onnx",
+          "model_id": "kokoro_multi_lang_or_japanese_vits",
+          "notes": "Test carefully; Japanese prosody is where cheap TTS goes to embarrass itself."
+        }
+      },
+      "normalization": {
+        "enabled": true,
+        "per_language": true,
+        "features": [
+          "numbers",
+          "dates",
+          "currency",
+          "urls",
+          "file_paths",
+          "code_identifiers",
+          "mixed_language_segments",
+          "punctuation_cleanup"
+        ]
+      },
+      "output": {
+        "format": "wav",
+        "sample_rate": 22050,
+        "streaming": true,
+        "cache_repeated_sentences": true
+      }
+    },
+    "language_detection": {
+      "enabled": true,
+      "strategy": "explicit_user_language_first_then_auto_detect",
+      "fast_detector": {
+        "engine": "fasttext_or_cld3",
+        "use_for": ["text", "ocr_output"]
+      },
+      "audio_language_detection": {
+        "engine": "whisper_language_detection",
+        "use_for": ["audio_before_transcription"]
+      },
+      "rules": [
+        {
+          "case": "user_selected_language_exists",
+          "action": "do_not_auto_detect"
+        },
+        {
+          "case": "mixed_text",
+          "action": "segment_by_script_then_route"
+        },
+        {
+          "case": "low_confidence",
+          "action": "run_fallback_model_and_compare"
+        }
+      ]
+    },
+    "postprocessing": {
+      "enabled": true,
+      "ocr": {
+        "preserve_code_blocks": true,
+        "preserve_file_paths": true,
+        "preserve_cli_commands": true,
+        "disable_spell_correction_for_code": true,
+        "rtl_reordering_for_persian": true,
+        "normalize_persian_arabic_characters": true,
+        "normalize_turkish_i": true,
+        "normalize_chinese_punctuation": true,
+        "normalize_japanese_full_width_chars": true
+      },
+      "asr": {
+        "punctuation_repair": true,
+        "segment_by_speaker": false,
+        "remove_hallucinated_silence_text": true,
+        "merge_short_segments": true,
+        "keep_word_timestamps": true
+      },
+      "tts": {
+        "split_long_sentences": true,
+        "avoid_reading_code_verbatim_by_default": true,
+        "code_reading_mode": "summarize_unless_user_requests_exact_readout"
+      }
+    }
+  },
+  "services": {
+    "ocr_service": {
+      "type": "local_http_service",
+      "suggested_port": 7811,
+      "lazy_load_models": true,
+      "max_concurrent_jobs": 2,
+      "queue": true
+    },
+    "asr_service": {
+      "type": "local_http_service",
+      "suggested_port": 7812,
+      "lazy_load_model": true,
+      "max_concurrent_jobs": 1,
+      "queue": true
+    },
+    "tts_service": {
+      "type": "local_http_service",
+      "suggested_port": 7813,
+      "lazy_load_voices": true,
+      "max_concurrent_jobs": 2,
+      "queue": true
+    }
+  },
+  "agentic_ide_integration": {
+    "capabilities": [
+      {
+        "name": "read_screen",
+        "input": "screenshot",
+        "pipeline": ["ocr.primary_fast", "postprocessing.ocr", "language_detection"],
+        "use_cases": ["understand_ui", "read_browser", "read_error_dialog", "read_terminal"]
+      },
+      {
+        "name": "read_document",
+        "input": "pdf_or_image",
+        "pipeline": ["ocr.primary_document", "postprocessing.ocr"],
+        "use_cases": ["parse_docs", "extract_tables", "summarize_pdf", "index_manuals"]
+      },
+      {
+        "name": "voice_command",
+        "input": "microphone_or_audio_file",
+        "pipeline": ["asr.primary", "postprocessing.asr", "intent_parser"],
+        "use_cases": ["dictation", "command_control", "meeting_notes"]
+      },
+      {
+        "name": "speak_response",
+        "input": "assistant_text",
+        "pipeline": ["language_detection", "tts.primary_engine"],
+        "use_cases": ["read_status", "summarize_result", "hands_free_mode"]
+      }
+    ],
+    "security": {
+      "no_audio_upload_by_default": true,
+      "no_screenshot_upload_by_default": true,
+      "redact_secrets_before_logging": true,
+      "never_log_raw_screen_by_default": true,
+      "secret_patterns": [
+        "api_key",
+        "authorization_bearer",
+        "password",
+        "private_key",
+        "ssh_key",
+        "jwt",
+        "cookie"
+      ]
+    },
+    "caching": {
+      "ocr_cache": true,
+      "asr_cache": true,
+      "tts_cache": true,
+      "cache_key": "sha256(input_bytes + model_id + language + options)",
+      "ttl_days": 14
+    }
+  },
+  "installation_profiles": {
+    "minimal_local": {
+      "description": "Lightweight setup for MacBook or small VPS.",
+      "asr": "faster-whisper-large-v3-turbo-int8",
+      "ocr": ["PaddleOCR_PP-OCRv5_fast", "Tesseract_fallback"],
+      "tts": ["Piper_per_language_voices"],
+      "avoid": ["PaddleOCR-VL_always_loaded", "Surya_always_loaded"]
+    },
+    "balanced_local": {
+      "description": "Best default for the agentic IDE.",
+      "asr": "faster-whisper-large-v3-turbo-int8_float16",
+      "ocr": ["PaddleOCR_PP-OCRv5_fast", "PaddleOCR-VL_lazy", "EasyOCR_fallback"],
+      "tts": ["Piper", "sherpa-onnx", "Kokoro_optional"]
+    },
+    "quality_local": {
+      "description": "Higher quality document parsing, more RAM and disk usage.",
+      "asr": "faster-whisper-large-v3-turbo-float16",
+      "ocr": ["PaddleOCR-VL", "Surya_optional", "PaddleOCR_PP-OCRv5_fast"],
+      "tts": ["best_available_per_language_voice"]
+    }
+  },
+  "do_not_do": [
+    "Do not use EasyOCR as the only OCR engine for serious documents.",
+    "Do not keep all TTS voices and OCR document models loaded at startup.",
+    "Do not auto-correct OCR output when the source is code, terminal output or config files.",
+    "Do not rely on Whisper auto language detection when the user already selected the language.",
+    "Do not send screenshots, audio or documents to cloud APIs unless the user explicitly enables cloud mode."
+  ]
+}

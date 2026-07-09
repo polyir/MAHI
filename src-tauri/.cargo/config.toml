@@ -1,0 +1,11 @@
+[env]
+# whisper-rs-sys/sherpa-rs-sys build whisper.cpp/sherpa-onnx (C++17, uses
+# std::filesystem) via cmake. Without this, two different tools in the build
+# chain each inject their own `-mmacosx-version-min` flag — one matching the
+# real SDK (26.x) and one hardcoded to 10.13 — and since clang honors the
+# last one on the command line, the build silently ends up targeting 10.13,
+# where std::filesystem::path is marked unavailable (introduced in 10.15),
+# and the whole build fails. Setting both env vars explicitly makes every
+# tool agree on the same (safely above 10.15) target.
+MACOSX_DEPLOYMENT_TARGET = "11.0"
+CMAKE_OSX_DEPLOYMENT_TARGET = "11.0"
