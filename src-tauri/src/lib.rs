@@ -1,6 +1,5 @@
 mod asr;
 mod checkpoint;
-mod external_tools;
 mod llm;
 mod media;
 mod models;
@@ -471,9 +470,6 @@ pub fn run() {
             llm::local_llm_stop,
             sessions::sessions_load,
             sessions::sessions_save,
-            external_tools::external_tools_list,
-            external_tools::external_tool_status,
-            external_tools::external_tool_install,
             open_console_window
         ])
         .build(tauri::generate_context!())

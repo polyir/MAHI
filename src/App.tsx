@@ -14,7 +14,6 @@ import {
   Command,
   Globe,
   HardDrive,
-  Blocks,
 } from "lucide-react";
 import "./ide/monacoSetup";
 import FileTree from "./components/FileTree";
@@ -31,7 +30,6 @@ import { getWindows, formatCountdown } from "./ide/limits";
 import { Provider, loadProviders, saveProviders, loadActiveProviderId, saveActiveProviderId, defaultProviders, withLocalProvider } from "./ide/providers";
 import ProvidersModal from "./ide/ProvidersModal";
 import ModelsModal from "./ide/ModelsModal";
-import ExternalToolsModal from "./ide/ExternalToolsModal";
 import { t, useLang } from "./ide/i18n";
 import { loadActiveAsrModel } from "./ide/models";
 import mahiLogo from "./assets/mahi.png";
@@ -57,7 +55,6 @@ export default function App() {
   const [model, setModel] = useState(localStorage.getItem("sakana_model") ?? "fugu");
   const [showProviders, setShowProviders] = useState(false);
   const [showModels, setShowModels] = useState(false);
-  const [showExternalTools, setShowExternalTools] = useState(false);
   const [workspace, setWorkspace] = useState(localStorage.getItem("vibe_workspace") ?? "");
   const [recents, setRecents] = useState<string[]>(loadRecents);
   const [tabs, setTabs] = useState<EditorTab[]>([]);
@@ -399,9 +396,6 @@ export default function App() {
         <button className="ghost" onClick={() => setShowModels(true)} title={t("manageModels")}>
           <HardDrive size={14} />
         </button>
-        <button className="ghost" onClick={() => setShowExternalTools(true)} title={t("manageExternalTools")}>
-          <Blocks size={14} />
-        </button>
       </div>
 
       <div className="main">
@@ -606,7 +600,6 @@ export default function App() {
       )}
 
       {showModels && <ModelsModal onClose={() => setShowModels(false)} />}
-      {showExternalTools && <ExternalToolsModal onClose={() => setShowExternalTools(false)} />}
 
       <div className="toasts">
         {toasts.map((t) => (

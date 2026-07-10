@@ -32,7 +32,6 @@ import {
 } from "../agent";
 import { isElevenLabsAsrEnabled, loadActiveAsrModel } from "./models";
 import { transcribeElevenLabs } from "./elevenlabs";
-import { GRAPHIFY_SYSTEM_NOTE, isGraphifyAvailable } from "./externalTools";
 import FishLoader from "./FishLoader";
 import { recordUsage } from "./limits";
 import { notifyTaskDone } from "./completion";
@@ -702,9 +701,6 @@ export default function ChatPanel({
     if (projectDir === workspace && openTabs.length) {
       systemContent += `\n\nCurrently open tabs in the IDE's editor/preview panel (the user can see these on screen): ${openTabs.join(", ")}`;
       if (activeTabPath) systemContent += `\nActive/focused tab: ${activeTabPath}`;
-    }
-    if (await isGraphifyAvailable()) {
-      systemContent += `\n\n${GRAPHIFY_SYSTEM_NOTE}`;
     }
     return systemContent;
   }
