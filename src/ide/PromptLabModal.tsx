@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Plus, Play, Send, Sparkles, Wand2 } from "lucide-react";
+import { Check, Info, Plus, Play, Send, Sparkles, Wand2 } from "lucide-react";
 import { t, dir as uiDir, useLang, getLang } from "./i18n";
 import type { StrKey } from "./i18n";
 import { useModalOpen } from "./modalTracker";
@@ -22,6 +22,9 @@ function templateName(id: string): string {
 }
 function templateDesc(id: string): string {
   return t(`template_${id}_desc` as StrKey);
+}
+function templateInfo(id: string): string {
+  return t(`template_${id}_info` as StrKey);
 }
 
 // A throwaway conversation for iterating on a prompt, entirely separate
@@ -71,6 +74,7 @@ export default function PromptLabModal({
   const [templateStarted, setTemplateStarted] = useState(false);
   const [templateDone, setTemplateDone] = useState(false);
   const [templateError, setTemplateError] = useState<string | null>(null);
+  const [showTemplateInfo, setShowTemplateInfo] = useState(false);
 
   const improveProviderId = loadImproveProviderId();
   const improveModel = loadImproveModel();
@@ -384,18 +388,46 @@ export default function PromptLabModal({
                 {!templateStarted ? (
                   <>
                     <div style={{ fontSize: 11.5, opacity: 0.6 }}>{t("promptLabTemplateNote")}</div>
-                    <select
-                      value={templateId}
-                      onChange={(e) => setTemplateId(e.target.value)}
-                      style={{ fontSize: 12.5 }}
-                    >
-                      {PROMPT_TEMPLATES.map((tpl) => (
-                        <option key={tpl.id} value={tpl.id}>
-                          {templateName(tpl.id)}
-                        </option>
-                      ))}
-                    </select>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <select
+                        value={templateId}
+                        onChange={(e) => setTemplateId(e.target.value)}
+                        style={{ fontSize: 12.5, flex: 1 }}
+                      >
+                        {PROMPT_TEMPLATES.map((tpl) => (
+                          <option key={tpl.id} value={tpl.id}>
+                            {templateName(tpl.id)}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="ghost"
+                        style={{ padding: 4, color: showTemplateInfo ? "var(--accent)" : undefined }}
+                        title={t("promptLabTemplateInfoTitle")}
+                        onClick={() => setShowTemplateInfo((v) => !v)}
+                      >
+                        <Info size={15} />
+                      </button>
+                    </div>
                     <div style={{ fontSize: 11, opacity: 0.55 }}>{templateDesc(templateId)}</div>
+                    {showTemplateInfo && (
+                      <div
+                        dir="auto"
+                        style={{
+                          fontSize: 12,
+                          lineHeight: 1.8,
+                          whiteSpace: "pre-wrap",
+                          background: "var(--bg-2)",
+                          border: "1px solid var(--border-soft)",
+                          borderRadius: 8,
+                          padding: 10,
+                          maxHeight: 220,
+                          overflowY: "auto",
+                        }}
+                      >
+                        {templateInfo(templateId)}
+                      </div>
+                    )}
                     <textarea
                       rows={9}
                       dir="auto"
