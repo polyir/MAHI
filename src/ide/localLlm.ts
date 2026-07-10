@@ -214,6 +214,16 @@ async function localCompleteMultiInner(opts: {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), opts.timeoutMs);
     try {
+      // Same /no_think suffix as localCompleteInner — without it, Qwen3's
+      // thinking mode burns most (or all) of maxTokens on a hidden <think>
+      // block, and if that block never closes before the cap, stripThinking
+      // has nothing to strip and the raw in-progress reasoning comes back
+      // as the "reply" (looked like a rambling, question-less response).
+      const lastIdx = opts.messages.length - 1;
+      const messages =
+        lastIdx >= 0 && opts.messages[lastIdx].role === "user"
+          ? opts.messages.map((m, i) => (i === lastIdx ? { ...m, content: `${m.content}\n/no_think` } : m))
+          : opts.messages;
       const resp = await tauriFetch(`${baseURL}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -221,7 +231,7 @@ async function localCompleteMultiInner(opts: {
         body: JSON.stringify({
           model: opts.modelId,
           stream: false,
-          messages: opts.messages,
+          messages,
           max_tokens: opts.maxTokens,
         }),
       });

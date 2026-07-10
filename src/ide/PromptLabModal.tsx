@@ -1,16 +1,28 @@
 import { useState } from "react";
-import { Check, Plus, Play, Wand2 } from "lucide-react";
+import { Check, Plus, Play, Send, Sparkles, Wand2 } from "lucide-react";
 import { t, dir as uiDir, useLang, getLang } from "./i18n";
+import type { StrKey } from "./i18n";
 import { useModalOpen } from "./modalTracker";
 import type { Provider } from "./providers";
 import { LOCAL_PROVIDER_ID } from "./providers";
 import { improvePromptSystem, loadImproveModel, loadImproveProviderId, localCompleteMulti } from "./localLlm";
 import { loadSavedPrompts, saveSavedPrompts } from "./promptLab";
 import type { SavedPrompt } from "./promptLab";
+import { FINAL_PROMPT_END, FINAL_PROMPT_START, PROMPT_TEMPLATES } from "./templates";
 import { makeClient } from "../agent";
 
 type LabMsg = { role: "system" | "user" | "assistant"; content: string };
 type Version = { id: string; label: string; content: string };
+
+// Template names/descriptions are user-facing i18n entries keyed by the
+// template's id (see i18n.ts's template_<id>_name/_desc), while PROMPT_TEMPLATES
+// itself only carries the LLM-facing system prompt — this bridges the two.
+function templateName(id: string): string {
+  return t(`template_${id}_name` as StrKey);
+}
+function templateDesc(id: string): string {
+  return t(`template_${id}_desc` as StrKey);
+}
 
 // A throwaway conversation for iterating on a prompt, entirely separate
 // from the main chat's session/history — messages live only in this
@@ -47,10 +59,18 @@ export default function PromptLabModal({
   const [savedPrompts, setSavedPrompts] = useState<SavedPrompt[]>(loadSavedPrompts);
   const [savingName, setSavingName] = useState<string | null>(null);
 
-  const [tab, setTab] = useState<"edit" | "test">("edit");
+  const [tab, setTab] = useState<"edit" | "template" | "test">("edit");
   const [testReply, setTestReply] = useState<string | null>(null);
   const [testBusy, setTestBusy] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
+
+  const [templateId, setTemplateId] = useState(PROMPT_TEMPLATES[0].id);
+  const [templateMessages, setTemplateMessages] = useState<LabMsg[]>([]);
+  const [templateAnswer, setTemplateAnswer] = useState("");
+  const [templateBusy, setTemplateBusy] = useState(false);
+  const [templateStarted, setTemplateStarted] = useState(false);
+  const [templateDone, setTemplateDone] = useState(false);
+  const [templateError, setTemplateError] = useState<string | null>(null);
 
   const improveProviderId = loadImproveProviderId();
   const improveModel = loadImproveModel();
@@ -150,6 +170,62 @@ export default function PromptLabModal({
     } finally {
       setTestBusy(false);
     }
+  }
+
+  async function runTemplateTurn(nextMessages: LabMsg[]) {
+    setTemplateBusy(true);
+    setTemplateError(null);
+    try {
+      const reply = await runMulti(nextMessages, 2500, 60_000);
+      if (!reply) {
+        setTemplateError(t("promptLabTemplateFailed"));
+        return;
+      }
+      setTemplateMessages([...nextMessages, { role: "assistant", content: reply }]);
+      const start = reply.indexOf(FINAL_PROMPT_START);
+      const end = reply.indexOf(FINAL_PROMPT_END);
+      if (start !== -1 && end !== -1 && end > start) {
+        const finalText = reply.slice(start + FINAL_PROMPT_START.length, end).trim();
+        setDraft(finalText);
+        const id = `v${Date.now()}`;
+        const tpl = PROMPT_TEMPLATES.find((tp) => tp.id === templateId);
+        setVersions((cur) => [
+          ...cur,
+          { id, label: `${t("promptLabTemplateVersionLabel")}: ${templateName(tpl?.id ?? templateId)}`, content: finalText },
+        ]);
+        setActiveVersionId(id);
+        setTemplateDone(true);
+      }
+    } finally {
+      setTemplateBusy(false);
+    }
+  }
+
+  function startTemplate() {
+    if (!draft.trim() || templateBusy) return;
+    const tpl = PROMPT_TEMPLATES.find((tp) => tp.id === templateId)!;
+    const initial: LabMsg[] = [
+      { role: "system", content: tpl.systemPrompt },
+      { role: "user", content: draft },
+    ];
+    setTemplateStarted(true);
+    setTemplateDone(false);
+    runTemplateTurn(initial);
+  }
+
+  function sendTemplateAnswer() {
+    if (!templateAnswer.trim() || templateBusy) return;
+    const userMsg: LabMsg = { role: "user", content: templateAnswer };
+    runTemplateTurn([...templateMessages, userMsg]);
+    setTemplateAnswer("");
+  }
+
+  function resetTemplate() {
+    setTemplateMessages([]);
+    setTemplateAnswer("");
+    setTemplateStarted(false);
+    setTemplateDone(false);
+    setTemplateError(null);
   }
 
   return (
@@ -269,6 +345,9 @@ export default function PromptLabModal({
               <button className={tab === "edit" ? "primary" : "ghost"} onClick={() => setTab("edit")}>
                 {t("promptLabEditTab")}
               </button>
+              <button className={tab === "template" ? "primary" : "ghost"} onClick={() => setTab("template")}>
+                {t("promptLabTemplateTab")}
+              </button>
               <button className={tab === "test" ? "primary" : "ghost"} onClick={() => setTab("test")}>
                 {t("promptLabTestTab")}
               </button>
@@ -300,6 +379,95 @@ export default function PromptLabModal({
                   </button>
                 </div>
               </>
+            ) : tab === "template" ? (
+              <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+                {!templateStarted ? (
+                  <>
+                    <div style={{ fontSize: 11.5, opacity: 0.6 }}>{t("promptLabTemplateNote")}</div>
+                    <select
+                      value={templateId}
+                      onChange={(e) => setTemplateId(e.target.value)}
+                      style={{ fontSize: 12.5 }}
+                    >
+                      {PROMPT_TEMPLATES.map((tpl) => (
+                        <option key={tpl.id} value={tpl.id}>
+                          {templateName(tpl.id)}
+                        </option>
+                      ))}
+                    </select>
+                    <div style={{ fontSize: 11, opacity: 0.55 }}>{templateDesc(templateId)}</div>
+                    <textarea
+                      rows={9}
+                      dir="auto"
+                      value={draft}
+                      onChange={(e) => setDraft(e.target.value)}
+                      placeholder={t("promptLabPlaceholder")}
+                      style={{ width: "100%", fontFamily: "inherit" }}
+                    />
+                    <button
+                      className="primary"
+                      disabled={!draft.trim() || templateBusy}
+                      onClick={startTemplate}
+                      style={{ alignSelf: "flex-start" }}
+                    >
+                      <Sparkles size={13} className={templateBusy ? "typing" : undefined} /> {t("promptLabTemplateStart")}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 6 }}>
+                      {templateMessages
+                        .filter((m) => m.role !== "system")
+                        .map((m, i) => (
+                          <div
+                            key={i}
+                            dir="auto"
+                            style={{
+                              fontSize: 12.5,
+                              padding: "6px 8px",
+                              borderRadius: 6,
+                              whiteSpace: "pre-wrap",
+                              background: m.role === "user" ? "var(--accent-soft)" : "var(--bg-2)",
+                              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                              maxWidth: "85%",
+                            }}
+                          >
+                            {templateDone && m.role === "assistant" && i === templateMessages.filter((x) => x.role !== "system").length - 1
+                              ? t("promptLabTemplateReady")
+                              : m.content}
+                          </div>
+                        ))}
+                      {templateBusy && <div style={{ fontSize: 11.5, opacity: 0.6 }}>{t("promptLabTemplateThinking")}</div>}
+                    </div>
+                    {templateError && <div style={{ color: "var(--red)", fontSize: 11.5 }}>{templateError}</div>}
+                    {!templateDone &&
+                      !templateBusy &&
+                      !templateError &&
+                      templateMessages.length > 0 &&
+                      templateMessages[templateMessages.length - 1].role === "assistant" && (
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <input
+                            dir="auto"
+                            autoFocus
+                            style={{ flex: 1 }}
+                            value={templateAnswer}
+                            onChange={(e) => setTemplateAnswer(e.target.value)}
+                            placeholder={t("promptLabTemplateAnswerPlaceholder")}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") sendTemplateAnswer();
+                            }}
+                          />
+                          <button className="ghost" disabled={templateBusy || !templateAnswer.trim()} onClick={sendTemplateAnswer}>
+                            <Send size={14} />
+                          </button>
+                        </div>
+                      )}
+                    <button className="ghost" style={{ alignSelf: "flex-start" }} onClick={resetTemplate}>
+                      {t("promptLabTemplateRestart")}
+                    </button>
+                  </>
+                )}
+              </div>
             ) : (
               <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}>
                 <div style={{ fontSize: 11.5, opacity: 0.6 }}>{t("promptLabTestNote")}</div>
