@@ -235,6 +235,38 @@ fn move_file(workspace: String, from: String, to: String) -> Result<(), String> 
     fs::rename(src, dst).map_err(|e| e.to_string())
 }
 
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &dst_path)?;
+        } else {
+            fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn copy_file(workspace: String, from: String, to: String) -> Result<(), String> {
+    let src = resolve(&workspace, &from)?;
+    let dst = resolve(&workspace, &to)?;
+    ensure_not_workspace_root(&workspace, &dst)?;
+    if src.is_dir() && dst.starts_with(&src) {
+        return Err("cannot copy a folder into itself".into());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if src.is_dir() {
+        copy_dir_all(&src, &dst).map_err(|e| e.to_string())
+    } else {
+        fs::copy(&src, &dst).map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Serialize)]
 struct CmdOutput {
     stdout: String,
@@ -448,6 +480,7 @@ pub fn run() {
             edit_file,
             delete_file,
             move_file,
+            copy_file,
             list_dir,
             run_command,
             search_files,

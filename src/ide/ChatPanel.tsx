@@ -32,6 +32,7 @@ import {
 } from "../agent";
 import { isElevenLabsAsrEnabled, loadActiveAsrModel } from "./models";
 import { transcribeElevenLabs } from "./elevenlabs";
+import { FILE_DRAG_MIME, readFileDragData } from "./fileOps";
 import FishLoader from "./FishLoader";
 import { recordUsage } from "./limits";
 import { notifyTaskDone } from "./completion";
@@ -155,6 +156,7 @@ export default function ChatPanel({
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [pastedImages, setPastedImages] = useState<string[]>([]);
+  const [fileDragOver, setFileDragOver] = useState(false);
   const [recording, setRecording] = useState(false);
   const [micConnecting, setMicConnecting] = useState(false);
   const [transcribingMic, setTranscribingMic] = useState(false);
@@ -517,6 +519,25 @@ export default function ChatPanel({
     setAttachments((cur) => (cur.includes(path) ? cur : [...cur, path]));
     setMentionOpen(false);
     inputRef.current?.focus();
+  }
+
+  // Dropped from the file tree, which is always rooted at `workspace` — only
+  // meaningful to attach when this chat's active project is that same folder
+  // (attachments are read via `read_file` against `projectDir`).
+  function onFileTreeDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setFileDragOver(false);
+    const payload = readFileDragData(e);
+    if (!payload) return;
+    if (payload.workspace !== projectDir) {
+      toast(t("droppedWrongProject"), "err");
+      return;
+    }
+    if (payload.isDir) {
+      toast(t("cannotAttachFolder"), "err");
+      return;
+    }
+    setAttachments((cur) => (cur.includes(payload.relPath) ? cur : [...cur, payload.relPath]));
   }
 
   function stop() {
@@ -1038,7 +1059,24 @@ export default function ChatPanel({
   }, [active.messages]);
 
   return (
-    <div className="chat" dir={uiDir()}>
+    <div
+      className={`chat${fileDragOver ? " drag-over" : ""}`}
+      dir={uiDir()}
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes(FILE_DRAG_MIME)) return;
+        e.preventDefault();
+      }}
+      onDragEnter={(e) => {
+        if (!e.dataTransfer.types.includes(FILE_DRAG_MIME)) return;
+        e.preventDefault();
+        setFileDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if ((e.currentTarget as HTMLDivElement).contains(e.relatedTarget as Node)) return;
+        setFileDragOver(false);
+      }}
+      onDrop={onFileTreeDrop}
+    >
       <div
         style={{
           display: "flex",

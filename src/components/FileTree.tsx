@@ -3,10 +3,34 @@ import { invoke } from "@tauri-apps/api/core";
 import { Folder, FolderOpen, FileText, Image, Music, Video } from "lucide-react";
 import { t, useLang } from "../ide/i18n";
 import { kindForPath } from "../ide/fileKind";
+import {
+  baseName,
+  FILE_DRAG_MIME,
+  joinRel,
+  parentDir,
+  readFileDragData,
+  setFileDragData,
+  uniqueDestName,
+} from "../ide/fileOps";
 
-type ContextMenuState = { x: number; y: number; workspace: string; relPath: string };
+type ContextMenuState = { x: number; y: number; workspace: string; relPath: string; isDir: boolean };
+type ClipboardEntry = { relPath: string; isDir: boolean; mode: "copy" | "cut" };
 
-function FileContextMenu({ menu, onClose }: { menu: ContextMenuState; onClose: () => void }) {
+function FileContextMenu({
+  menu,
+  clipboard,
+  onClose,
+  onCopy,
+  onCut,
+  onPaste,
+}: {
+  menu: ContextMenuState;
+  clipboard: ClipboardEntry | null;
+  onClose: () => void;
+  onCopy: (relPath: string, isDir: boolean) => void;
+  onCut: (relPath: string, isDir: boolean) => void;
+  onPaste: (menu: ContextMenuState) => void;
+}) {
   useEffect(() => {
     const close = () => onClose();
     window.addEventListener("click", close);
@@ -24,18 +48,53 @@ function FileContextMenu({ menu, onClose }: { menu: ContextMenuState; onClose: (
     onClose();
   }
 
+  const isRoot = menu.relPath === ".";
+
   return (
     <div
       className="context-menu"
       style={{ position: "fixed", left: menu.x, top: menu.y, zIndex: 100 }}
       onClick={(e) => e.stopPropagation()}
     >
-      <div className="tree-node" onClick={() => copy(`${menu.workspace}/${menu.relPath}`)}>
-        {t("copyPath")}
-      </div>
-      <div className="tree-node" onClick={() => copy(menu.relPath)}>
-        {t("copyRelativePath")}
-      </div>
+      {!isRoot && (
+        <>
+          <div className="tree-node" onClick={() => copy(`${menu.workspace}/${menu.relPath}`)}>
+            {t("copyPath")}
+          </div>
+          <div className="tree-node" onClick={() => copy(menu.relPath)}>
+            {t("copyRelativePath")}
+          </div>
+          <div
+            className="tree-node"
+            onClick={() => {
+              onCopy(menu.relPath, menu.isDir);
+              onClose();
+            }}
+          >
+            {t("copyFile")}
+          </div>
+          <div
+            className="tree-node"
+            onClick={() => {
+              onCut(menu.relPath, menu.isDir);
+              onClose();
+            }}
+          >
+            {t("cutFile")}
+          </div>
+        </>
+      )}
+      {clipboard && (
+        <div
+          className="tree-node"
+          onClick={() => {
+            onPaste(menu);
+            onClose();
+          }}
+        >
+          {t("pasteFile")}
+        </div>
+      )}
     </div>
   );
 }
@@ -66,6 +125,7 @@ function Node({
   depth,
   version,
   onContextMenu,
+  onDropInto,
 }: {
   workspace: string;
   relPath: string;
@@ -74,10 +134,12 @@ function Node({
   onOpenFile: (relPath: string) => void;
   depth: number;
   version: number;
-  onContextMenu: (e: React.MouseEvent, relPath: string) => void;
+  onContextMenu: (e: React.MouseEvent, relPath: string, isDir: boolean) => void;
+  onDropInto: (targetRelPath: string, targetIsDir: boolean, payload: ReturnType<typeof readFileDragData>) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<Entry[] | null>(null);
+  const [dragOver, setDragOver] = useState(false);
 
   async function fetchChildren() {
     try {
@@ -109,11 +171,34 @@ function Node({
         onClick={toggle}
         onContextMenu={(e) => {
           e.preventDefault();
-          onContextMenu(e, relPath);
+          e.stopPropagation();
+          onContextMenu(e, relPath, isDir);
+        }}
+        draggable
+        onDragStart={(e) => setFileDragData(e, { workspace, relPath, isDir })}
+        onDragOver={(e) => {
+          if (!e.dataTransfer.types.includes(FILE_DRAG_MIME)) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+        }}
+        onDragEnter={(e) => {
+          if (!e.dataTransfer.types.includes(FILE_DRAG_MIME)) return;
+          e.preventDefault();
+          setDragOver(true);
+        }}
+        onDragLeave={() => setDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          setDragOver(false);
+          onDropInto(relPath, isDir, readFileDragData(e));
         }}
         className="tree-node"
         dir="ltr"
-        style={{ paddingLeft: 8 + depth * 12 }}
+        style={{
+          paddingLeft: 8 + depth * 12,
+          background: dragOver ? "var(--accent-soft)" : undefined,
+        }}
         title={relPath}
       >
         {isDir ? (
@@ -140,6 +225,7 @@ function Node({
             depth={depth + 1}
             version={version}
             onContextMenu={onContextMenu}
+            onDropInto={onDropInto}
           />
         ))}
     </div>
@@ -150,14 +236,17 @@ export default function FileTree({
   workspace,
   onOpenFile,
   version = 0,
+  toast,
 }: {
   workspace: string;
   onOpenFile: (relPath: string) => void;
   version?: number;
+  toast?: (text: string, kind?: "ok" | "err") => void;
 }) {
   useLang();
   const [rootEntries, setRootEntries] = useState<Entry[] | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [clipboard, setClipboard] = useState<ClipboardEntry | null>(null);
 
   useEffect(() => {
     if (!workspace) {
@@ -169,6 +258,37 @@ export default function FileTree({
       .catch(() => setRootEntries([]));
   }, [workspace, version]);
 
+  async function moveOrCopy(mode: "copy" | "cut", srcRelPath: string, srcIsDir: boolean, targetDirRaw: string) {
+    const targetDir = targetDirRaw === "." ? "" : targetDirRaw;
+    if (srcIsDir && (targetDir === srcRelPath || targetDir.startsWith(`${srcRelPath}/`))) {
+      toast?.(t("cannotMoveIntoSelf"), "err");
+      return;
+    }
+    if (mode === "cut" && targetDir === parentDir(srcRelPath)) return; // already there
+    try {
+      const destName = await uniqueDestName(workspace, targetDir, baseName(srcRelPath));
+      const destRel = joinRel(targetDir, destName);
+      await invoke(mode === "copy" ? "copy_file" : "move_file", { workspace, from: srcRelPath, to: destRel });
+    } catch (e) {
+      toast?.(String(e), "err");
+    }
+  }
+
+  function handlePaste(menu: ContextMenuState) {
+    if (!clipboard) return;
+    const targetDir = menu.isDir ? menu.relPath : parentDir(menu.relPath);
+    moveOrCopy(clipboard.mode, clipboard.relPath, clipboard.isDir, targetDir);
+    if (clipboard.mode === "cut") setClipboard(null);
+  }
+
+  function handleDropInto(targetRelPath: string, targetIsDir: boolean, payload: ReturnType<typeof readFileDragData>) {
+    if (!payload || payload.workspace !== workspace) return;
+    if (payload.relPath === targetRelPath) return; // dropped onto itself
+    const targetDir = targetIsDir ? (targetRelPath === "." ? "" : targetRelPath) : parentDir(targetRelPath);
+    if (targetDir === parentDir(payload.relPath)) return; // already there
+    moveOrCopy("cut", payload.relPath, payload.isDir, targetDir);
+  }
+
   if (!workspace) {
     return <div style={{ padding: 10, fontSize: 12, opacity: 0.6 }}>{t("noFolderSelected")}</div>;
   }
@@ -177,7 +297,21 @@ export default function FileTree({
   }
 
   return (
-    <div style={{ overflowY: "auto", flex: 1, paddingBottom: 8 }}>
+    <div
+      style={{ overflowY: "auto", flex: 1, paddingBottom: 8 }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setContextMenu({ x: e.clientX, y: e.clientY, workspace, relPath: ".", isDir: true });
+      }}
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes(FILE_DRAG_MIME)) return;
+        e.preventDefault();
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        handleDropInto(".", true, readFileDragData(e));
+      }}
+    >
       {rootEntries.map((e) => (
         <Node
           key={e.name}
@@ -188,10 +322,20 @@ export default function FileTree({
           onOpenFile={onOpenFile}
           depth={0}
           version={version}
-          onContextMenu={(e2, relPath) => setContextMenu({ x: e2.clientX, y: e2.clientY, workspace, relPath })}
+          onContextMenu={(e2, relPath, isDir) => setContextMenu({ x: e2.clientX, y: e2.clientY, workspace, relPath, isDir })}
+          onDropInto={handleDropInto}
         />
       ))}
-      {contextMenu && <FileContextMenu menu={contextMenu} onClose={() => setContextMenu(null)} />}
+      {contextMenu && (
+        <FileContextMenu
+          menu={contextMenu}
+          clipboard={clipboard}
+          onClose={() => setContextMenu(null)}
+          onCopy={(relPath, isDir) => setClipboard({ relPath, isDir, mode: "copy" })}
+          onCut={(relPath, isDir) => setClipboard({ relPath, isDir, mode: "cut" })}
+          onPaste={handlePaste}
+        />
+      )}
     </div>
   );
 }

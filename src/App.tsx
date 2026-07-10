@@ -470,7 +470,7 @@ export default function App() {
                       <div className="panel-header">
                         <Files size={11} /> {t("files")}
                       </div>
-                      <FileTree workspace={workspace} onOpenFile={openFile} version={treeVersion} />
+                      <FileTree workspace={workspace} onOpenFile={openFile} version={treeVersion} toast={toast} />
                     </>
                   ) : (
                     <SearchPanel workspace={workspace} onOpen={openFile} />

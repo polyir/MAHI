@@ -372,6 +372,10 @@ select:focus {
   background: var(--bg-1);
   min-width: 0;
 }
+.chat.drag-over {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+}
 .chat-msgs {
   flex: 1;
   overflow-y: auto;
