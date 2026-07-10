@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ReasoningEffort } from "../agent";
 import { t, dir, useLang, getLang, setLang, LANGS, Lang } from "../ide/i18n";
+import { useModalOpen } from "../ide/modalTracker";
 
 export type SessionSettings = {
   systemPrompt: string;
@@ -20,6 +21,7 @@ export default function SettingsModal({
   onClose: () => void;
 }) {
   useLang();
+  useModalOpen(true);
   const [local, setLocal] = useState<SessionSettings>(settings);
 
   return (

@@ -22,6 +22,7 @@ import {
   saveImproveProviderId,
 } from "./localLlm";
 import { t, dir as uiDir, useLang, StrKey } from "./i18n";
+import { useModalOpen } from "./modalTracker";
 
 const ROLE_LABEL_KEY: Record<ProviderRole, StrKey> = {
   chat: "roleChat",
@@ -40,6 +41,7 @@ export default function ProvidersModal({
   onClose: () => void;
 }) {
   useLang();
+  useModalOpen(true);
   // The built-in local-LLM provider is virtual/auto-managed — nothing to
   // edit here (no baseURL/apiKey/models to configure), so it never appears
   // in this editable list at all.

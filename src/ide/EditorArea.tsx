@@ -1,7 +1,8 @@
 import { useEffect, useReducer, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import Editor from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
-import { X, Code, Eye, ArrowRightLeft, Globe, Plus, RotateCw, Captions } from "lucide-react";
+import { X, Code, Eye, ArrowRightLeft, Globe, Plus, RotateCw, Captions, MousePointerClick } from "lucide-react";
 import { langForPath } from "./monacoSetup";
 import { kindForPath, isBinaryKind } from "./fileKind";
 import { resolveDirection, setDirOverride } from "./textDirection";
@@ -70,6 +71,7 @@ export default function EditorArea({
   // lives in localStorage (via textDirection.ts) rather than React state.
   const [, bumpDir] = useReducer((x: number) => x + 1, 0);
   const [addressInput, setAddressInput] = useState("");
+  const [inspectingTabId, setInspectingTabId] = useState<string | null>(null);
 
   useEffect(() => {
     if (goto && active && goto.path === active.path && editorRef.current) {
@@ -92,6 +94,29 @@ export default function EditorArea({
     if (!/^[a-zA-Z]+:\/\//.test(next)) next = "https://" + next;
     setAddressInput(next);
     onNavigateBrowser(activeBrowserTab.id, next);
+  }
+
+  // Inspect mode only ever runs for the tab you're actually looking at —
+  // switching away (or the tab closing) turns it off rather than leaving a
+  // picker silently armed on a page you can't see.
+  useEffect(() => {
+    if (inspectingTabId && inspectingTabId !== activeBrowserId) {
+      invoke("browser_stop_picker", { tabId: inspectingTabId }).catch(() => {});
+      setInspectingTabId(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeBrowserId]);
+
+  function toggleInspect() {
+    if (!activeBrowserTab) return;
+    const tabId = activeBrowserTab.id;
+    if (inspectingTabId === tabId) {
+      invoke("browser_stop_picker", { tabId }).catch(() => {});
+      setInspectingTabId(null);
+    } else {
+      invoke("browser_start_picker", { tabId }).catch(() => {});
+      setInspectingTabId(tabId);
+    }
   }
 
   const kind = active ? kindForPath(active.path) : "text";
@@ -189,7 +214,7 @@ export default function EditorArea({
               title={tab.path}
               className={`tab ${!browserActive && i === activeIndex ? "on" : ""}`}
             >
-              <span dir="ltr">{baseName(tab.path)}</span>
+              <span className="label" dir="ltr">{baseName(tab.path)}</span>
               {dirty && <span className="dot">●</span>}
               <span
                 className="close"
@@ -211,7 +236,7 @@ export default function EditorArea({
             className={`tab ${bt.id === activeBrowserId ? "on" : ""}`}
           >
             <Globe size={12} />
-            <span dir="ltr">{bt.title || bt.url}</span>
+            <span className="label" dir="ltr">{bt.title || bt.url}</span>
             <span
               className="close"
               onClick={(e) => {
@@ -261,6 +286,14 @@ export default function EditorArea({
           />
           <button className="ghost" onClick={goAddress} title="Go">
             <RotateCw size={13} />
+          </button>
+          <button
+            className="ghost"
+            onClick={toggleInspect}
+            title={t("inspectElementTitle")}
+            style={{ color: inspectingTabId === activeBrowserTab?.id ? "var(--accent)" : undefined }}
+          >
+            <MousePointerClick size={13} />
           </button>
         </div>
       )}

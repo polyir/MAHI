@@ -1,4 +1,5 @@
 mod asr;
+mod browser;
 mod checkpoint;
 mod llm;
 mod media;
@@ -471,6 +472,7 @@ pub fn run() {
         .manage(tts::TtsManager::default())
         .manage(watcher::WatcherManager::default())
         .manage(llm::LlamaManager::default())
+        .manage(browser::PickerManager::default())
         .invoke_handler(tauri::generate_handler![
             read_file,
             register_asset_scope,
@@ -503,6 +505,13 @@ pub fn run() {
             llm::local_llm_stop,
             sessions::sessions_load,
             sessions::sessions_save,
+            browser::browser_open,
+            browser::browser_reposition,
+            browser::browser_navigate,
+            browser::browser_hide,
+            browser::browser_close,
+            browser::browser_start_picker,
+            browser::browser_stop_picker,
             open_console_window
         ])
         .build(tauri::generate_context!())

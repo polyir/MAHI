@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Plus,
@@ -17,6 +18,8 @@ import {
   Mic,
   Wand2,
   FlaskConical,
+  Check,
+  X,
 } from "lucide-react";
 import {
   agentTurn,
@@ -155,6 +158,8 @@ export default function ChatPanel({
   const [showPromptLab, setShowPromptLab] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [pickedElement, setPickedElement] = useState<{ tag: string; text: string; selector: string } | null>(null);
+  const [elementComment, setElementComment] = useState("");
   const [pastedImages, setPastedImages] = useState<string[]>([]);
   const [fileDragOver, setFileDragOver] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -222,6 +227,21 @@ export default function ChatPanel({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  // Fired by the browser tab's "inspect element" mode (see browser.rs) —
+  // global rather than scoped to a specific tab/project, since only one
+  // ChatPanel is ever mounted at a time in this single-pane layout.
+  useEffect(() => {
+    const unlisten = listen<{ tabId: string; tag: string; text: string; selector: string }>(
+      "browser-element-picked",
+      (e) => {
+        setPickedElement({ tag: e.payload.tag, text: e.payload.text, selector: e.payload.selector });
+        setElementComment("");
+      }
+    );
+    return () => {
+      unlisten.then((un) => un());
+    };
   }, []);
   // One-time migration off localStorage (see sessions.ts) — on the first
   // launch after upgrading, the file doesn't exist yet, so `sessions` stays
@@ -519,6 +539,23 @@ export default function ChatPanel({
     setAttachments((cur) => (cur.includes(path) ? cur : [...cur, path]));
     setMentionOpen(false);
     inputRef.current?.focus();
+  }
+
+  function confirmElementComment() {
+    if (!pickedElement) return;
+    const label = pickedElement.text ? `<${pickedElement.tag}> "${pickedElement.text}"` : `<${pickedElement.tag}>`;
+    const ref = `[${t("inspectElementRefLabel")}: ${label} — selector: ${pickedElement.selector}]`;
+    const note = elementComment.trim();
+    const line = note ? `${ref} ${note}` : ref;
+    setInput((cur) => (cur.trim() ? `${cur}\n${line}` : line));
+    setPickedElement(null);
+    setElementComment("");
+    inputRef.current?.focus();
+  }
+
+  function cancelElementPick() {
+    setPickedElement(null);
+    setElementComment("");
   }
 
   // Dropped from the file tree, which is always rooted at `workspace` — only
@@ -1242,6 +1279,46 @@ export default function ChatPanel({
                 {f}
               </div>
             ))}
+          </div>
+        )}
+
+        {pickedElement && (
+          <div
+            dir="auto"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+              padding: 8,
+              marginBottom: 7,
+              border: "1px solid var(--border-soft)",
+              borderRadius: 8,
+              background: "var(--bg-2)",
+            }}
+          >
+            <div style={{ fontSize: 11.5, opacity: 0.7 }} dir="ltr">
+              {pickedElement.text ? `<${pickedElement.tag}> "${pickedElement.text}"` : `<${pickedElement.tag}>`}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input
+                autoFocus
+                dir="auto"
+                style={{ flex: 1 }}
+                value={elementComment}
+                onChange={(e) => setElementComment(e.target.value)}
+                placeholder={t("inspectElementCommentPlaceholder")}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") confirmElementComment();
+                  if (e.key === "Escape") cancelElementPick();
+                }}
+              />
+              <button className="ghost" onClick={confirmElementComment}>
+                <Check size={13} />
+              </button>
+              <button className="ghost" onClick={cancelElementPick}>
+                <X size={13} />
+              </button>
+            </div>
           </div>
         )}
 

@@ -4,6 +4,7 @@ import { Globe } from "lucide-react";
 import { parseUsage } from "./usage";
 import { getWindows, formatCountdown, WindowStat } from "./limits";
 import { t, dir as uiDir, useLang } from "./i18n";
+import { useModalOpen } from "./modalTracker";
 
 function WindowBar({ label, stat }: { label: string; stat: WindowStat }) {
   return (
@@ -32,6 +33,7 @@ export default function UsagePanel({
   onClose: () => void;
 }) {
   useLang();
+  useModalOpen(true);
   const parsed = headers ? parseUsage(headers) : null;
   const hasRateHeaders = parsed && Object.keys(parsed.raw).length > 0;
   const [windows] = useState(() => getWindows());

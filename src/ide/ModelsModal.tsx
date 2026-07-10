@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Download, Trash2, Check, RefreshCw } from "lucide-react";
 import { t, dir as uiDir, useLang } from "./i18n";
+import { useModalOpen } from "./modalTracker";
 import {
   ModelStatus,
   TtsBackend,
@@ -82,6 +83,7 @@ function LocalCtxControl({ modelId }: { modelId: string }) {
 
 export default function ModelsModal({ onClose }: { onClose: () => void }) {
   useLang();
+  useModalOpen(true);
   const [models, setModels] = useState<ModelStatus[] | null>(null);
   const [downloading, setDownloading] = useState<Record<string, DownloadProgress>>({});
   const [error, setError] = useState<string | null>(null);

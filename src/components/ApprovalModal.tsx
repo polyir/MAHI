@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import DiffView from "./DiffView";
 import { t, dir as uiDir, useLang } from "../ide/i18n";
+import { useModalOpen } from "../ide/modalTracker";
 
 export type PendingApproval = {
   toolName: string;
@@ -18,6 +19,7 @@ export default function ApprovalModal({
   onDecide: (approved: boolean) => void;
 }) {
   useLang();
+  useModalOpen(true);
   const [oldContent, setOldContent] = useState<string | null>(null);
 
   useEffect(() => {
