@@ -14,6 +14,8 @@ export const FINAL_PROMPT_END = "<<<END_FINAL_PROMPT>>>";
 // wrapped in fixed markers so the UI can tell "still asking" apart from
 // "done" without any structured output support from the model.
 const PROTOCOL = `
+Never invent or assume specific details (names, numbers, formats, reasons, alternatives) that the user has not actually stated, even if a plausible-sounding value would fit. If you don't have a real answer for something essential from the checklist above, that counts as missing — ask about it, don't guess at it.
+
 If anything essential above is missing or too vague to act on, ask exactly ONE short, specific question about the single most important missing piece, and reply with nothing else — no preamble, no numbered list of everything still missing.
 
 Once everything essential is present, reply with ONLY the following, no text before or after it:
