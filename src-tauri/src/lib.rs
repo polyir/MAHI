@@ -483,6 +483,7 @@ pub fn run() {
             write_file,
             media::write_file_binary,
             media::save_temp_image,
+            media::delete_temp_image,
             edit_file,
             delete_file,
             move_file,

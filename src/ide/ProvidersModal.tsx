@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Plus, Trash2, RefreshCw } from "lucide-react";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import {
@@ -78,6 +78,20 @@ export default function ProvidersModal({
   const dictationModelSafe = dictationProvider?.models.includes(dictationModel)
     ? dictationModel
     : dictationProvider?.models[0] ?? "";
+
+  useEffect(() => {
+    if (improveModel !== improveModelSafe) {
+      setImproveModel(improveModelSafe);
+      saveImproveModel(improveModelSafe);
+    }
+  }, [improveModel, improveModelSafe]);
+
+  useEffect(() => {
+    if (dictationModel !== dictationModelSafe) {
+      setDictationModel(dictationModelSafe);
+      saveDictationModel(dictationModelSafe);
+    }
+  }, [dictationModel, dictationModelSafe]);
 
   function update(i: number, patch: Partial<Provider>) {
     setLocal((cur) => cur.map((p, j) => (j === i ? { ...p, ...patch } : p)));

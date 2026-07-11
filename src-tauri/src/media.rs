@@ -40,3 +40,26 @@ pub fn save_temp_image(base64_content: String, extension: String) -> Result<Stri
     fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(path.to_string_lossy().to_string())
 }
+
+/// Deletes a temp image previously created by save_temp_image. Best-effort:
+/// only paths inside the OS temp dir whose file name matches our own
+/// "mahi-vision-" prefix are removable, so a stray/malicious path can't be
+/// used to delete arbitrary files. A missing file is treated as success.
+#[tauri::command]
+pub fn delete_temp_image(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    let in_temp = p.starts_with(std::env::temp_dir());
+    let named_ours = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("mahi-vision-"))
+        .unwrap_or(false);
+    if !in_temp || !named_ours {
+        return Err("refused: not a MAHI temp image path".into());
+    }
+    match fs::remove_file(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}

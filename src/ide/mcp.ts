@@ -122,19 +122,36 @@ export function invalidateMcpToolCache(serverId?: string) {
 
 const MCP_PREFIX = "mcp__";
 
-function mcpFnName(serverId: string, toolName: string): string {
-  return `${MCP_PREFIX}${serverId}__${toolName}`;
+function encodeMcpPart(value: string): string {
+  // Function names may only contain letters/numbers/underscore and must be
+  // parsed back losslessly. Hex encoding is verbose but unambiguous and uses
+  // only schema-safe characters; it also avoids the old brittle assumption
+  // that server ids never contain underscores.
+  return Array.from(new TextEncoder().encode(value))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
-// Relies on server ids never containing "_" (see addMcpServer below) so the
-// first "__" after the prefix unambiguously separates id from tool name,
-// even though tool names themselves often contain underscores.
+function decodeMcpPart(value: string): string | null {
+  if (!value || value.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(value)) return null;
+  const bytes = new Uint8Array(value.match(/../g)!.map((h) => parseInt(h, 16)));
+  return new TextDecoder().decode(bytes);
+}
+
+function mcpFnName(serverId: string, toolName: string): string {
+  return `${MCP_PREFIX}${encodeMcpPart(serverId)}__${toolName}`;
+}
+
 function parseMcpFnName(fnName: string): { serverId: string; toolName: string } | null {
   if (!fnName.startsWith(MCP_PREFIX)) return null;
   const rest = fnName.slice(MCP_PREFIX.length);
   const sep = rest.indexOf("__");
   if (sep === -1) return null;
-  return { serverId: rest.slice(0, sep), toolName: rest.slice(sep + 2) };
+  const maybeEncodedId = rest.slice(0, sep);
+  const toolName = rest.slice(sep + 2);
+  const serverId = decodeMcpPart(maybeEncodedId) ?? maybeEncodedId;
+  if (!serverId || !toolName) return null;
+  return { serverId, toolName };
 }
 
 export function isMcpToolName(fnName: string): boolean {

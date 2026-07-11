@@ -51,6 +51,23 @@ export function sanitizeEffort(v: any): ReasoningEffort {
   return REASONING_EFFORTS.includes(v) ? v : "high";
 }
 
+function providerLooksLikeGemini(provider?: Provider): boolean {
+  const haystack = `${provider?.id ?? ""} ${provider?.name ?? ""} ${provider?.baseURL ?? ""}`.toLowerCase();
+  return haystack.includes("gemini") || haystack.includes("generativelanguage.googleapis.com");
+}
+
+function modelLooksLikeFixedTemperatureReasoning(model: string): boolean {
+  const m = model.toLowerCase();
+  // OpenAI o-series / GPT-5-style reasoning models commonly reject custom
+  // temperature; Gemini can also 400 intermittently through compatibility
+  // layers when sampling params are mixed with tool-calling streams.
+  return /(^|[-_:])o[1-9](?:[-_:]|$)/.test(m) || m.startsWith("gpt-5") || m.includes("reasoning");
+}
+
+function shouldSendTemperature(provider: Provider | undefined, model: string): boolean {
+  return !providerLooksLikeGemini(provider) && !modelLooksLikeFixedTemperatureReasoning(model);
+}
+
 // Tool calls that mutate the filesystem or run arbitrary shell commands
 // require explicit user approval before executing, unless auto-approve is on.
 export const SENSITIVE_TOOLS = new Set([
@@ -940,6 +957,33 @@ export async function agentTurn(
   const activeTools = isBrowserToolsEnabled()
     ? [...tools, ...alwaysOnTools(), ...BROWSER_TOOLS, ...mcpTools, ...callModelTools]
     : [...tools, ...alwaysOnTools(), ...mcpTools, ...callModelTools];
+  const validToolNames = new Set(
+    activeTools.map((tool) => (tool as any).function?.name).filter(Boolean) as string[]
+  );
+  function normalizeToolName(name: string): string {
+    if (validToolNames.has(name)) return name;
+    // Repair legacy/current Gemini-stream corruption where the same complete
+    // function name was appended once per chunk, e.g.
+    // "glob_filesglob_filesglob_files". Without this, pressing Continue in an
+    // already-corrupted chat would keep resending invalid assistant tool_calls
+    // and Gemini would keep returning 400.
+    for (const valid of validToolNames) {
+      if (
+        valid &&
+        name.length > valid.length &&
+        name.length % valid.length === 0 &&
+        name === valid.repeat(name.length / valid.length)
+      ) {
+        return valid;
+      }
+    }
+    return name;
+  }
+  for (const m of history) {
+    if (m.role === "assistant" && m.tool_calls?.length) {
+      for (const tc of m.tool_calls) tc.function.name = normalizeToolName(tc.function.name);
+    }
+  }
   // Some providers' chat endpoints flat-out reject image content in messages
   // (confirmed for Z.AI/GLM: a 400 on messages.content.type before the model
   // ever runs) — supportsVision === false means don't even try. The image(s)
@@ -966,11 +1010,18 @@ export async function agentTurn(
     return `\n\n[${images.length} image(s) attached — this model can't see images directly in chat. If a vision-capable tool is available, use it on: ${paths.join(", ")}]`;
   }
 
-  // Each iteration is a full re-bill of the conversation, so the cap is the
-  // last defense against runaway spend. If a legit big task hits it, the
-  // user resumes with the Continue button — nothing is lost.
-  const MAX_ITERS = 24;
-  for (let iter = 0; iter < MAX_ITERS; iter++) {
+  async function cleanupTempImages(): Promise<void> {
+    await Promise.allSettled(
+      Array.from(new Set(tempImagePaths.values())).map((path) => invoke("delete_temp_image", { path }))
+    );
+  }
+
+  try {
+    // Each iteration is a full re-bill of the conversation, so the cap is the
+    // last defense against runaway spend. If a legit big task hits it, the
+    // user resumes with the Continue button — nothing is lost.
+    const MAX_ITERS = 24;
+    for (let iter = 0; iter < MAX_ITERS; iter++) {
     // Mid-turn compaction: long turns are exactly where runaway usage
     // happens (dozens of calls, each resending everything). Trigger at 70%
     // of budget; escalate with a smaller raw window if still over.
@@ -988,28 +1039,35 @@ export async function agentTurn(
     }
     const sentChars = chars;
 
-    // Only messages that actually carry pasted images need reshaping;
-    // everything else is sent exactly as before (unchanged risk/behavior for
-    // the common no-image case).
-    const apiMessages = !history.some((m) => m.images?.length)
-      ? history
-      : supportsVision
-      ? history.map((m) =>
-          m.images?.length
-            ? {
-                role: m.role,
-                content: [
-                  ...(m.content ? [{ type: "text", text: m.content }] : []),
-                  ...m.images.map((url) => ({ type: "image_url", image_url: { url } })),
-                ],
-              }
-            : m
-        )
-      : await Promise.all(
-          history.map(async (m) =>
-            m.images?.length ? { role: m.role, content: `${m.content}${await imagesToPathNote(m.images)}` } : m
-          )
-        );
+    // Build strict Chat Completions messages. Our in-app Msg carries UI/local
+    // bookkeeping fields (toolName/toolArgs/checkpointId/images) that are not
+    // part of the OpenAI schema; some providers ignore extras, but Gemini's
+    // OpenAI-compatible endpoint is stricter and can reject them with 400.
+    const apiMessages = await Promise.all(
+      history.map(async (m) => {
+        if (m.role === "assistant") {
+          const out: any = { role: "assistant", content: m.content };
+          if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
+          return out;
+        }
+        if (m.role === "tool") {
+          return { role: "tool", tool_call_id: m.tool_call_id, content: m.content };
+        }
+        if (m.images?.length) {
+          if (supportsVision) {
+            return {
+              role: m.role,
+              content: [
+                ...(m.content ? [{ type: "text", text: m.content }] : []),
+                ...m.images.map((url) => ({ type: "image_url", image_url: { url } })),
+              ],
+            };
+          }
+          return { role: m.role, content: `${m.content}${await imagesToPathNote(m.images)}` };
+        }
+        return { role: m.role, content: m.content };
+      })
+    );
 
     const params: any = {
       model,
@@ -1019,7 +1077,9 @@ export async function agentTurn(
       stream_options: { include_usage: true },
     };
     if (opts.reasoningEffort) params.reasoning_effort = opts.reasoningEffort;
-    if (opts.temperature !== undefined) params.temperature = opts.temperature;
+    if (opts.temperature !== undefined && shouldSendTemperature(opts.chatProvider, model)) {
+      params.temperature = opts.temperature;
+    }
 
     let content = "";
     const callMap = new Map<number, { id?: string; name: string; arguments: string }>();
@@ -1056,7 +1116,16 @@ export async function agentTurn(
               const idx = tc.index ?? 0;
               const existing = callMap.get(idx) ?? { name: "", arguments: "" };
               if (tc.id) existing.id = tc.id;
-              if (tc.function?.name) existing.name += tc.function.name;
+              // OpenAI streams a tool call's name ONCE (first chunk) and only
+              // streams `arguments` incrementally afterwards. Google's Gemini
+              // OpenAI-compat layer instead repeats the FULL function name in
+              // EVERY streamed chunk of the same call. Appending it produced
+              // mangled names like "glob_filesglob_filesglob_files", which the
+              // API then rejects with a bare 400 once the corrupt tool_call is
+              // echoed back in history. Assign (not append) so both incremental
+              // (OpenAI) and repeated-full (Gemini) streaming yield one clean
+              // name — a function name is never split across chunks.
+              if (tc.function?.name) existing.name = tc.function.name;
               if (tc.function?.arguments) existing.arguments += tc.function.arguments;
               callMap.set(idx, existing);
             }
@@ -1242,10 +1311,13 @@ export async function agentTurn(
     }
   }
 
-  // Cap reached mid-task: surface it as an interruption so the Continue
-  // button appears (the ⚠️ prefix is what canContinue/continueTurn key on).
-  opts.onStep({
-    role: "assistant",
-    content: t("iterCap"),
-  });
+    // Cap reached mid-task: surface it as an interruption so the Continue
+    // button appears (the ⚠️ prefix is what canContinue/continueTurn key on).
+    opts.onStep({
+      role: "assistant",
+      content: t("iterCap"),
+    });
+  } finally {
+    await cleanupTempImages();
+  }
 }
