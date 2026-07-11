@@ -3,10 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { reportRateLimitReset } from "./ide/limits";
 import { t } from "./ide/i18n";
-import { Provider, ProviderRole, findProviderForRole, isBrowserToolsEnabled } from "./ide/providers";
+import { Provider, ProviderRole, findProviderForRole, isBrowserToolsEnabled, LOCAL_PROVIDER_ID } from "./ide/providers";
 import { loadActiveAsrModel, loadTtsBackend, loadVoiceForLang } from "./ide/models";
 import { getLang } from "./ide/i18n";
 import { synthesizeElevenLabs } from "./ide/elevenlabs";
+import { McpServer, buildMcpTools, isMcpToolName, runMcpTool } from "./ide/mcp";
 
 export type ToolCall = {
   id: string;
@@ -64,6 +65,7 @@ export const SENSITIVE_TOOLS = new Set([
   "browser_navigate",
   "browser_close",
   "speak_text",
+  "call_model",
 ]);
 
 // Embedded-browser tools are handled by a separate dispatch path (they don't
@@ -563,6 +565,64 @@ async function runMediaTool(
   }
 }
 
+// call_model: lets the current turn's model delegate a sub-task to a
+// DIFFERENT configured provider/model (e.g. a Skill/Workflow markdown file
+// saying "have Gemini do the translation step"). Gated behind
+// opts.allowModelRouting (see agentTurn) — a per-session switch the user
+// explicitly turns on, confirmed once per project via a popup — so this
+// tool is simply absent from activeTools otherwise, not just discouraged.
+// Deliberately a single plain completion with NO tools of its own: the
+// sub-model can't call further tools (including call_model itself), so
+// there's no recursive delegation chain to reason about or runaway on.
+function buildCallModelTool(providers: Provider[]): OpenAI.Chat.Completions.ChatCompletionTool {
+  const available = providers
+    .filter((p) => p.id !== LOCAL_PROVIDER_ID && p.apiKey)
+    .map((p) => `${p.id} (${p.name}): ${p.models.join(", ")}`)
+    .join("; ");
+  return {
+    type: "function",
+    function: {
+      name: "call_model",
+      description:
+        `Delegate a sub-task to a different configured model — use only when explicitly instructed to (e.g. a workflow/skill file naming a specific model for a specific step), not on your own initiative. Returns that model's plain text reply; it has no tools of its own and cannot see this conversation's history, so include everything it needs in the prompt. Available provider_id/model combinations: ${available || "(none configured with an API key)"}.`,
+      parameters: {
+        type: "object",
+        properties: {
+          provider_id: { type: "string", description: "One of the provider ids listed above." },
+          model: { type: "string", description: "One of that provider's model ids listed above." },
+          prompt: { type: "string", description: "The task/content to send to that model." },
+          system_prompt: { type: "string", description: "Optional system prompt for the sub-call." },
+        },
+        required: ["provider_id", "model", "prompt"],
+      },
+    },
+  };
+}
+
+async function runCallModelTool(providers: Provider[], args: any): Promise<string> {
+  const provider = providers.find((p) => p.id === args.provider_id);
+  if (!provider) return `error: unknown provider_id "${args.provider_id}" — check the tool's listed available providers.`;
+  if (!provider.apiKey) return `error: provider "${provider.name}" has no API key configured in Settings → Providers.`;
+  if (!args.model || !provider.models.includes(args.model)) {
+    return `error: "${args.model}" is not one of ${provider.name}'s configured models (${provider.models.join(", ")}).`;
+  }
+  if (!args.prompt) return "error: prompt is required.";
+  try {
+    const client = makeClient(provider.apiKey, provider.baseURL);
+    const resp = await client.chat.completions.create({
+      model: args.model,
+      messages: [
+        ...(args.system_prompt ? [{ role: "system" as const, content: args.system_prompt }] : []),
+        { role: "user" as const, content: args.prompt },
+      ],
+    });
+    const text = resp.choices?.[0]?.message?.content;
+    return text || "error: the delegated model returned an empty response.";
+  } catch (e) {
+    return `error: ${String(e)}`;
+  }
+}
+
 // Backs the embedded-browser tools. Implemented in App.tsx against React
 // state (the browser tabs live there, not in Rust) — navigate/close return
 // null/false when the given (or default active) tab id doesn't exist.
@@ -650,6 +710,15 @@ export type AgentOptions = {
   // chat's project isn't the folder open in the IDE, so the tool can return
   // a clear error instead of silently doing nothing.
   openFile?: (path: string, line?: number) => void;
+  // Enabled servers' tools get discovered and merged into this turn's tool
+  // list (see mcp.ts's buildMcpTools) and dispatched back through
+  // runMcpTool when called. Undefined/empty means no MCP tools this turn.
+  mcpServers?: McpServer[];
+  // Per-session switch (see ChatPanel's model-routing toggle) — call_model
+  // is only added to activeTools when true, so the model literally cannot
+  // delegate to another model unless the user has explicitly turned this on
+  // for the current session.
+  allowModelRouting?: boolean;
 };
 
 function isRetryable(e: any): boolean {
@@ -866,9 +935,36 @@ export async function agentTurn(
   // for the whole content again (in every subsequent call of the turn).
   const readSeen = new Map<string, string>();
   const budget = opts.contextBudget ?? 200_000;
+  const mcpTools = opts.mcpServers?.length ? await buildMcpTools(opts.mcpServers) : [];
+  const callModelTools = opts.allowModelRouting ? [buildCallModelTool(opts.allProviders ?? [])] : [];
   const activeTools = isBrowserToolsEnabled()
-    ? [...tools, ...alwaysOnTools(), ...BROWSER_TOOLS]
-    : [...tools, ...alwaysOnTools()];
+    ? [...tools, ...alwaysOnTools(), ...BROWSER_TOOLS, ...mcpTools, ...callModelTools]
+    : [...tools, ...alwaysOnTools(), ...mcpTools, ...callModelTools];
+  // Some providers' chat endpoints flat-out reject image content in messages
+  // (confirmed for Z.AI/GLM: a 400 on messages.content.type before the model
+  // ever runs) — supportsVision === false means don't even try. The image(s)
+  // still need to reach the model somehow, so each one is saved to a temp
+  // file once per turn (cached here so repeat iterations of the same turn
+  // don't re-save it) and its path is inlined into the message as plain
+  // text, letting the model hand that path to a vision-capable MCP tool
+  // instead of seeing it inline.
+  const supportsVision = opts.chatProvider?.supportsVision !== false;
+  const tempImagePaths = new Map<string, string>();
+  async function imagesToPathNote(images: string[]): Promise<string> {
+    const paths = await Promise.all(
+      images.map(async (dataUrl) => {
+        const cached = tempImagePaths.get(dataUrl);
+        if (cached) return cached;
+        const match = /^data:image\/(\w+);base64,(.+)$/.exec(dataUrl);
+        const ext = match?.[1] === "jpeg" ? "jpg" : match?.[1] ?? "png";
+        const base64 = match?.[2] ?? dataUrl.split(",").pop() ?? "";
+        const path = await invoke<string>("save_temp_image", { base64Content: base64, extension: ext });
+        tempImagePaths.set(dataUrl, path);
+        return path;
+      })
+    );
+    return `\n\n[${images.length} image(s) attached — this model can't see images directly in chat. If a vision-capable tool is available, use it on: ${paths.join(", ")}]`;
+  }
 
   // Each iteration is a full re-bill of the conversation, so the cap is the
   // last defense against runaway spend. If a legit big task hits it, the
@@ -892,10 +988,12 @@ export async function agentTurn(
     }
     const sentChars = chars;
 
-    // Only messages that actually carry pasted images need reshaping into
-    // OpenAI's multipart vision format; everything else is sent exactly as
-    // before (unchanged risk/behavior for the common no-image case).
-    const apiMessages = history.some((m) => m.images?.length)
+    // Only messages that actually carry pasted images need reshaping;
+    // everything else is sent exactly as before (unchanged risk/behavior for
+    // the common no-image case).
+    const apiMessages = !history.some((m) => m.images?.length)
+      ? history
+      : supportsVision
       ? history.map((m) =>
           m.images?.length
             ? {
@@ -907,7 +1005,11 @@ export async function agentTurn(
               }
             : m
         )
-      : history;
+      : await Promise.all(
+          history.map(async (m) =>
+            m.images?.length ? { role: m.role, content: `${m.content}${await imagesToPathNote(m.images)}` } : m
+          )
+        );
 
     const params: any = {
       model,
@@ -1081,6 +1183,11 @@ export async function agentTurn(
             }
           }
         }
+      } else if (call.function.name === "call_model") {
+        const approved = await opts.requestApproval(call.function.name, args);
+        result = approved
+          ? await runCallModelTool(opts.allProviders ?? [], args)
+          : "Rejected by user. Do not retry this exact action without asking.";
       } else if (call.function.name in MEDIA_TOOLS) {
         const approved = await opts.requestApproval(call.function.name, args);
         if (!approved) {
@@ -1110,6 +1217,8 @@ export async function agentTurn(
         // The file changed; a later re-read must return fresh content.
         if (approved && args?.path) readSeen.delete(args.path);
         if (approved && args?.to) readSeen.delete(args.to);
+      } else if (isMcpToolName(call.function.name)) {
+        result = await runMcpTool(opts.mcpServers ?? [], call.function.name, args);
       } else {
         result = await runTool(workspace, call.function.name, args, opts.checkpointId);
         if (call.function.name === "read_file" && args?.path) {

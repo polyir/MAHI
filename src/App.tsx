@@ -14,6 +14,9 @@ import {
   Command,
   Globe,
   HardDrive,
+  Download,
+  FlipHorizontal,
+  FlipVertical,
 } from "lucide-react";
 import "./ide/monacoSetup";
 import FileTree from "./components/FileTree";
@@ -28,6 +31,8 @@ import { EditorTab, baseName } from "./ide/types";
 import { kindForPath, isBinaryKind } from "./ide/fileKind";
 import { getWindows, formatCountdown } from "./ide/limits";
 import { Provider, loadProviders, saveProviders, loadActiveProviderId, saveActiveProviderId, defaultProviders, withLocalProvider } from "./ide/providers";
+import { McpServer, loadMcpServers, saveMcpServers } from "./ide/mcp";
+import { UpdateInfo, checkForUpdate, downloadUpdate, installDownloadedUpdate } from "./ide/updater";
 import ProvidersModal from "./ide/ProvidersModal";
 import ModelsModal from "./ide/ModelsModal";
 import { t, useLang } from "./ide/i18n";
@@ -52,6 +57,9 @@ export default function App() {
   useLang();
   const [providers, setProviders] = useState<Provider[]>(loadProviders);
   const [activeProviderId, setActiveProviderId] = useState<string>(loadActiveProviderId);
+  const [mcpServers, setMcpServers] = useState<McpServer[]>(() =>
+    loadMcpServers(loadProviders().find((p) => p.id === "zai")?.apiKey ?? "")
+  );
   const [model, setModel] = useState(localStorage.getItem("sakana_model") ?? "fugu");
   const [showProviders, setShowProviders] = useState(false);
   const [showModels, setShowModels] = useState(false);
@@ -59,9 +67,24 @@ export default function App() {
   const [recents, setRecents] = useState<string[]>(loadRecents);
   const [tabs, setTabs] = useState<EditorTab[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [sideView, setSideView] = useState<"files" | "search" | null>("files");
-  const [showTerminal, setShowTerminal] = useState(true);
+  const [sideView, setSideView] = useState<"files" | "search" | null>(null);
+  const [showTerminal, setShowTerminal] = useState(false);
   const [showChat, setShowChat] = useState(true);
+  // Panel arrangement toggles — quick swap buttons rather than free-form
+  // drag-and-drop (a deliberately smaller feature than a full docking
+  // system): chatOnLeft flips chat/editor left-right, sidebarBottomSwapped
+  // flips which content (files/search vs terminal) sits in the left-side
+  // vertical slot vs the bottom-of-editor horizontal slot. Both content
+  // sets stay independently toggleable either way.
+  const [chatOnLeft, setChatOnLeft] = useState(() => localStorage.getItem("mahi_chat_on_left") === "1");
+  const [sidebarBottomSwapped, setSidebarBottomSwapped] = useState(
+    () => localStorage.getItem("mahi_sidebar_bottom_swapped") === "1"
+  );
+  useEffect(() => localStorage.setItem("mahi_chat_on_left", chatOnLeft ? "1" : "0"), [chatOnLeft]);
+  useEffect(
+    () => localStorage.setItem("mahi_sidebar_bottom_swapped", sidebarBottomSwapped ? "1" : "0"),
+    [sidebarBottomSwapped]
+  );
   const [browserTabs, setBrowserTabs] = useState<BrowserTab[]>([]);
   const [activeBrowserId, setActiveBrowserId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
@@ -77,9 +100,60 @@ export default function App() {
   // doesn't linger.
   const [fileVersions, setFileVersions] = useState<Record<string, number>>({});
   const [limitWindows, setLimitWindows] = useState(() => getWindows());
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  // "idle" while still downloading, "ready" once the button should become
+  // clickable, "error" if the download itself failed (install was never
+  // reached). Deliberately separate from the install step below — see
+  // updater.ts's comment for why these are split rather than one combined
+  // call.
+  const [downloadState, setDownloadState] = useState<"idle" | "downloading" | "ready" | "error">("idle");
+  const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
+  const [installing, setInstalling] = useState(false);
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
   const toastCounter = useRef(0);
+
+  // Checked on launch, then every hour — so a release that goes out while
+  // the app is already open (this can stay running for a long session) is
+  // still caught without needing a manual restart. A failed check (offline,
+  // server down) is silent and doesn't clear an already-found update: this
+  // is a nice-to-have, not something that should ever interrupt work.
+  useEffect(() => {
+    checkForUpdate().then((u) => u && setUpdateInfo(u));
+    const id = setInterval(() => {
+      checkForUpdate().then((u) => u && setUpdateInfo(u));
+    }, 60 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // As soon as a release is found, download it in the background — no user
+  // action needed for this part. The app keeps running normally throughout;
+  // only the (separate, explicit) install step below ever closes it.
+  useEffect(() => {
+    if (!updateInfo || downloadState !== "idle") return;
+    setDownloadState("downloading");
+    downloadUpdate(updateInfo.update, (downloaded, total) => {
+      setDownloadProgress(total ? Math.round((downloaded / total) * 100) : null);
+    })
+      .then(() => setDownloadState("ready"))
+      .catch((e) => {
+        console.warn("update download failed:", e);
+        setDownloadState("error");
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [updateInfo]);
+
+  async function handleInstall() {
+    if (!updateInfo || downloadState !== "ready" || installing) return;
+    setInstalling(true);
+    try {
+      await installDownloadedUpdate(updateInfo.update);
+      // Relaunches on success — this line only runs if that somehow didn't happen.
+    } catch (e) {
+      toast(String(e), "err");
+      setInstalling(false);
+    }
+  }
 
   // Refresh the usage-window countdown in the status bar every 30s, and
   // whenever token totals change (a request just finished).
@@ -90,6 +164,7 @@ export default function App() {
   useEffect(() => setLimitWindows(getWindows()), [totalTokens]);
 
   useEffect(() => saveProviders(providers), [providers]);
+  useEffect(() => saveMcpServers(mcpServers), [mcpServers]);
   useEffect(() => saveActiveProviderId(activeProviderId), [activeProviderId]);
   useEffect(() => localStorage.setItem("sakana_model", model), [model]);
   useEffect(() => localStorage.setItem("vibe_workspace", workspace), [workspace]);
@@ -355,12 +430,71 @@ export default function App() {
     },
   ];
 
+  // Which content sits in the left-side vertical slot vs the
+  // bottom-of-editor horizontal slot swaps as a pair (see
+  // sidebarBottomSwapped) — each one's own visibility toggle
+  // (sideView/showTerminal) still applies to whichever slot it currently
+  // occupies.
+  const sidebarVisible = sidebarBottomSwapped ? showTerminal : !!sideView;
+  const bottomVisible = sidebarBottomSwapped ? !!sideView : showTerminal;
+  const filesOrSearchContent =
+    sideView === "files" ? (
+      <>
+        <div className="panel-header">
+          <Files size={11} /> {t("files")}
+        </div>
+        <FileTree workspace={workspace} onOpenFile={openFile} version={treeVersion} toast={toast} />
+      </>
+    ) : (
+      <SearchPanel workspace={workspace} onOpen={openFile} />
+    );
+  const terminalContent = (
+    <>
+      <div className="panel-header">
+        <TerminalSquare size={11} /> {t("terminal")}
+      </div>
+      <div style={{ flex: 1, minHeight: 0 }}>
+        <TerminalPanel workspace={workspace} />
+      </div>
+    </>
+  );
+  const chatPanelNode = (
+    <ChatPanel
+      provider={activeProvider}
+      providers={providers}
+      mcpServers={mcpServers}
+      onMcpServersChange={setMcpServers}
+      model={model}
+      workspace={workspace}
+      onFileChanged={onFileChanged}
+      onUsageChange={setTotalTokens}
+      onHeaders={setUsageHeaders}
+      toast={toast}
+      openTabs={tabs.map((tb) => tb.path)}
+      activeTabPath={tabs[activeIndex]?.path ?? null}
+      onOpenFileForAgent={openFile}
+      onOpenModels={() => setShowModels(true)}
+      browserControl={{
+        open: agentBrowserOpen,
+        navigate: agentBrowserNavigate,
+        close: agentBrowserClose,
+        screenshot: agentBrowserScreenshot,
+      }}
+    />
+  );
+
   return (
     <div className="ide-root">
+      <div className="bg-glow-container">
+        <div className="bg-glow bg-glow-1"></div>
+        <div className="bg-glow bg-glow-2"></div>
+        <div className="bg-glow bg-glow-3"></div>
+      </div>
       <div className="titlebar">
         <span className="brand">
           <img src={mahiLogo} alt="MAHI" className="brand-logo" />
-          MAHI
+          <span className="brand-text">MAHI</span>
+          <span className="brand-fish-swim"></span>
         </span>
         {workspace && (
           <button className="ghost" onClick={pickWorkspace} title={workspace}>
@@ -396,6 +530,22 @@ export default function App() {
         <button className="ghost" onClick={() => setShowModels(true)} title={t("manageModels")}>
           <HardDrive size={14} />
         </button>
+        {updateInfo && downloadState !== "error" && (
+          <button
+            className="ghost"
+            onClick={handleInstall}
+            disabled={downloadState !== "ready" || installing}
+            title={updateInfo.notes || ""}
+            style={{ color: "var(--accent)", borderColor: "var(--accent)" }}
+          >
+            <Download size={14} />
+            {installing
+              ? t("updating")
+              : downloadState === "ready"
+              ? `${t("installUpdate")} v${updateInfo.version}`
+              : `${t("downloadingUpdate")}${downloadProgress != null ? ` ${downloadProgress}%` : ""}`}
+          </button>
+        )}
       </div>
 
       <div className="main">
@@ -436,13 +586,24 @@ export default function App() {
             <Globe size={19} />
           </button>
           <div className="spacer" />
+          <button className="act-btn" onClick={() => setChatOnLeft((v) => !v)} title={t("swapChatSideTitle")}>
+            <FlipHorizontal size={17} />
+          </button>
+          <button
+            className="act-btn"
+            onClick={() => setSidebarBottomSwapped((v) => !v)}
+            title={t("swapSidebarTerminalTitle")}
+          >
+            <FlipVertical size={17} />
+          </button>
           <button className="act-btn" onClick={() => setShowUsage(true)} title={t("usageLimit")}>
             <BarChart3 size={19} />
           </button>
         </div>
 
         {!workspace ? (
-          <div className="welcome" style={{ flex: 1 }}>
+          <div className="welcome panel-tazhib-decoration" style={{ flex: 1 }}>
+            <div className="tazhib-bottom-corners"></div>
             <img src={mahiLogo} alt="MAHI" className="welcome-logo" />
             <h2>MAHI</h2>
             <div className="sub">{t("welcomeSub")}</div>
@@ -461,28 +622,24 @@ export default function App() {
             )}
           </div>
         ) : (
-          <PanelGroup direction="horizontal" style={{ flex: 1 }}>
-            {sideView && (
-              <Panel key="side" order={1} defaultSize={17} minSize={11}>
-                <div className="sidebar">
-                  {sideView === "files" ? (
-                    <>
-                      <div className="panel-header">
-                        <Files size={11} /> {t("files")}
-                      </div>
-                      <FileTree workspace={workspace} onOpenFile={openFile} version={treeVersion} toast={toast} />
-                    </>
-                  ) : (
-                    <SearchPanel workspace={workspace} onOpen={openFile} />
-                  )}
-                </div>
+          <PanelGroup direction="horizontal" style={{ flex: 1 }} autoSaveId="mahi-main-horizontal">
+            {chatOnLeft && showChat && (
+              <Panel key="chat" order={1} defaultSize={45} minSize={18}>
+                {chatPanelNode}
               </Panel>
             )}
-            {sideView && <PanelResizeHandle key="side-h" className="resize-h" />}
+            {chatOnLeft && showChat && <PanelResizeHandle key="chat-h-left" className="resize-h" />}
 
-            <Panel key="center" order={2} defaultSize={sideView ? 55 : 72} minSize={25}>
-              <PanelGroup direction="vertical">
-                <Panel key="editor" order={1} defaultSize={showTerminal ? 68 : 100} minSize={20}>
+            {sidebarVisible && (
+              <Panel key="side" order={2} defaultSize={17} minSize={11}>
+                <div className="sidebar">{sidebarBottomSwapped ? terminalContent : filesOrSearchContent}</div>
+              </Panel>
+            )}
+            {sidebarVisible && <PanelResizeHandle key="side-h" className="resize-h" />}
+
+            <Panel key="center" order={3} defaultSize={sidebarVisible ? 38 : 55} minSize={25}>
+              <PanelGroup direction="vertical" autoSaveId="mahi-center-vertical">
+                <Panel key="editor" order={1} defaultSize={bottomVisible ? 68 : 100} minSize={20}>
                   <EditorArea
                     workspace={workspace}
                     tabs={tabs}
@@ -502,45 +659,21 @@ export default function App() {
                     fileVersions={fileVersions}
                   />
                 </Panel>
-                {showTerminal && <PanelResizeHandle key="term-h" className="resize-v" />}
-                {showTerminal && (
-                  <Panel key="terminal" order={2} defaultSize={32} minSize={10}>
+                {bottomVisible && <PanelResizeHandle key="term-h" className="resize-v" />}
+                {bottomVisible && (
+                  <Panel key="bottom" order={2} defaultSize={32} minSize={10}>
                     <div className="sidebar" style={{ background: "var(--bg-0)" }}>
-                      <div className="panel-header">
-                        <TerminalSquare size={11} /> {t("terminal")}
-                      </div>
-                      <div style={{ flex: 1, minHeight: 0 }}>
-                        <TerminalPanel workspace={workspace} />
-                      </div>
+                      {sidebarBottomSwapped ? filesOrSearchContent : terminalContent}
                     </div>
                   </Panel>
                 )}
               </PanelGroup>
             </Panel>
 
-            {showChat && <PanelResizeHandle key="chat-h" className="resize-h" />}
-            {showChat && (
-              <Panel key="chat" order={3} defaultSize={28} minSize={18}>
-                <ChatPanel
-                  provider={activeProvider}
-                  providers={providers}
-                  model={model}
-                  workspace={workspace}
-                  onFileChanged={onFileChanged}
-                  onUsageChange={setTotalTokens}
-                  onHeaders={setUsageHeaders}
-                  toast={toast}
-                  openTabs={tabs.map((tb) => tb.path)}
-                  activeTabPath={tabs[activeIndex]?.path ?? null}
-                  onOpenFileForAgent={openFile}
-                  onOpenModels={() => setShowModels(true)}
-                  browserControl={{
-                    open: agentBrowserOpen,
-                    navigate: agentBrowserNavigate,
-                    close: agentBrowserClose,
-                    screenshot: agentBrowserScreenshot,
-                  }}
-                />
+            {!chatOnLeft && showChat && <PanelResizeHandle key="chat-h-right" className="resize-h" />}
+            {!chatOnLeft && showChat && (
+              <Panel key="chat" order={4} defaultSize={45} minSize={18}>
+                {chatPanelNode}
               </Panel>
             )}
           </PanelGroup>
@@ -596,6 +729,8 @@ export default function App() {
             setProviders(withLocal);
             if (!withLocal.find((x) => x.id === activeProviderId) && withLocal[0]) setActiveProviderId(withLocal[0].id);
           }}
+          mcpServers={mcpServers}
+          onSaveMcp={setMcpServers}
         />
       )}
 

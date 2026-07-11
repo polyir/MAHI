@@ -48,6 +48,8 @@ export default function ApprovalModal({
             ? t("approvalGenerate")
             : ["browser_navigate", "browser_close"].includes(pending.toolName)
             ? t("approvalBrowser")
+            : pending.toolName === "call_model"
+            ? t("approvalCallModel")
             : t("approvalEdit")}
         </h3>
 
@@ -96,6 +98,12 @@ export default function ApprovalModal({
         {pending.toolName === "browser_close" && (
           <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13 }}>
             close: {pending.args.tab_id ? `tab ${pending.args.tab_id}` : "active tab"}
+          </pre>
+        )}
+
+        {pending.toolName === "call_model" && (
+          <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>
+            {pending.args.provider_id}/{pending.args.model}:{"\n"}"{pending.args.prompt}"
           </pre>
         )}
 

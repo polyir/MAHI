@@ -11,7 +11,9 @@
 // rendered at roughly half that on a 2x display), so the frontend now does
 // that multiplication itself (see BrowserTabView.tsx) and sends raw
 // physical pixels here.
+use base64::Engine;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewBuilder, WebviewUrl};
@@ -119,18 +121,32 @@ fn stop_picker_task(state: &tauri::State<PickerManager>, tab_id: &str) {
 }
 
 #[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct PickedElement {
     tab_id: String,
     tag: String,
     text: String,
     selector: String,
+    // The clicked element's own getBoundingClientRect(), in CSS px relative
+    // to the page's viewport (not our app window) — lets the frontend ask
+    // browser_capture_element_screenshot for a cropped screenshot of just
+    // this element, without the picker script itself touching pixels.
+    rect_x: f64,
+    rect_y: f64,
+    rect_w: f64,
+    rect_h: f64,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawPicked {
     tag: String,
     text: String,
     selector: String,
+    rect_x: f64,
+    rect_y: f64,
+    rect_w: f64,
+    rect_h: f64,
 }
 
 // `true` re-attach guard lets browser_start_picker be called again on the
@@ -174,10 +190,15 @@ const PICKER_INJECT_SCRIPT: &str = r##"(function() {
     e.preventDefault();
     e.stopPropagation();
     const el = e.target;
+    const r = el.getBoundingClientRect();
     window.__mahiPending = {
       tag: el.tagName.toLowerCase(),
       text: ((el.innerText || el.value || "") + "").trim().slice(0, 120),
-      selector: cssPath(el)
+      selector: cssPath(el),
+      rectX: r.x,
+      rectY: r.y,
+      rectW: r.width,
+      rectH: r.height
     };
   }
   document.addEventListener("mouseover", onOver, true);
@@ -222,6 +243,10 @@ pub fn browser_start_picker(app: AppHandle, state: tauri::State<PickerManager>, 
                             tag: picked.tag,
                             text: picked.text,
                             selector: picked.selector,
+                            rect_x: picked.rect_x,
+                            rect_y: picked.rect_y,
+                            rect_w: picked.rect_w,
+                            rect_h: picked.rect_h,
                         },
                     );
                 }
@@ -242,4 +267,65 @@ pub fn browser_stop_picker(app: AppHandle, state: tauri::State<PickerManager>, t
         let _ = wv.eval(PICKER_STOP_SCRIPT);
     }
     Ok(())
+}
+
+// Crops a screenshot down to just the picked element, so the user can attach
+// a visual (not just the tag/selector reference) for models that support
+// vision. Same OS-level window capture as window_screenshot (see
+// screenshot.rs) rather than a <canvas> read of the page — a canvas read
+// would be tainted for any cross-origin content and can't see into an
+// iframe anyway. rect_x/y/w/h are the element's own getBoundingClientRect()
+// (CSS px, already scaled to physical pixels by the frontend to match
+// wv.position()'s units) relative to the *page's* viewport; this adds the
+// webview's own position within the app window, plus the window's frame
+// thickness (inner_position - outer_position, i.e. the title bar height),
+// to land on a crop rect within the full-window capture.
+#[tauri::command]
+pub fn browser_capture_element_screenshot(
+    app: AppHandle,
+    tab_id: String,
+    rect_x: f64,
+    rect_y: f64,
+    rect_w: f64,
+    rect_h: f64,
+) -> Result<String, String> {
+    let wv = app.get_webview(&label_for(&tab_id)).ok_or("browser not open")?;
+    let wv_pos = wv.position().map_err(|e| e.to_string())?;
+    let main = app.get_window("main").ok_or("no main window")?;
+    let inner = main.inner_position().map_err(|e| e.to_string())?;
+    let outer = main.outer_position().map_err(|e| e.to_string())?;
+
+    let abs_x = wv_pos.x as f64 + rect_x + (inner.x - outer.x) as f64;
+    let abs_y = wv_pos.y as f64 + rect_y + (inner.y - outer.y) as f64;
+
+    let windows = xcap::Window::all().map_err(|e| e.to_string())?;
+    let win = windows
+        .into_iter()
+        .find(|w| w.title().map(|t| t == "MAHI").unwrap_or(false))
+        .ok_or("MAHI window not found")?;
+    let image = win.capture_image().map_err(|e| e.to_string())?;
+
+    let img_w = image.width() as f64;
+    let img_h = image.height() as f64;
+    let crop_x = abs_x.clamp(0.0, img_w);
+    let crop_y = abs_y.clamp(0.0, img_h);
+    let crop_w = rect_w.min(img_w - crop_x).max(0.0);
+    let crop_h = rect_h.min(img_h - crop_y).max(0.0);
+    if crop_w < 1.0 || crop_h < 1.0 {
+        return Err("element is off-screen".into());
+    }
+
+    let cropped = image::imageops::crop_imm(
+        &image,
+        crop_x as u32,
+        crop_y as u32,
+        crop_w as u32,
+        crop_h as u32,
+    )
+    .to_image();
+    let mut buf = Vec::new();
+    cropped
+        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
 }

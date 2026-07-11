@@ -126,6 +126,7 @@ function Node({
   version,
   onContextMenu,
   onDropInto,
+  index,
 }: {
   workspace: string;
   relPath: string;
@@ -136,6 +137,7 @@ function Node({
   version: number;
   onContextMenu: (e: React.MouseEvent, relPath: string, isDir: boolean) => void;
   onDropInto: (targetRelPath: string, targetIsDir: boolean, payload: ReturnType<typeof readFileDragData>) => void;
+  index: number;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<Entry[] | null>(null);
@@ -193,12 +195,13 @@ function Node({
           setDragOver(false);
           onDropInto(relPath, isDir, readFileDragData(e));
         }}
-        className="tree-node"
+        className="tree-node stagger-item"
         dir="ltr"
         style={{
           paddingLeft: 8 + depth * 12,
           background: dragOver ? "var(--accent-soft)" : undefined,
-        }}
+          "--i": index,
+        } as React.CSSProperties}
         title={relPath}
       >
         {isDir ? (
@@ -214,7 +217,7 @@ function Node({
       </div>
       {isDir &&
         expanded &&
-        children?.map((c) => (
+        children?.map((c, idx) => (
           <Node
             key={c.name}
             workspace={workspace}
@@ -226,6 +229,7 @@ function Node({
             version={version}
             onContextMenu={onContextMenu}
             onDropInto={onDropInto}
+            index={idx}
           />
         ))}
     </div>
@@ -312,7 +316,7 @@ export default function FileTree({
         handleDropInto(".", true, readFileDragData(e));
       }}
     >
-      {rootEntries.map((e) => (
+      {rootEntries.map((e, idx) => (
         <Node
           key={e.name}
           workspace={workspace}
@@ -324,6 +328,7 @@ export default function FileTree({
           version={version}
           onContextMenu={(e2, relPath, isDir) => setContextMenu({ x: e2.clientX, y: e2.clientY, workspace, relPath, isDir })}
           onDropInto={handleDropInto}
+          index={idx}
         />
       ))}
       {contextMenu && (

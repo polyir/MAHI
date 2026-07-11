@@ -16,10 +16,12 @@ export default function Message({
   msg,
   workspace,
   getScreenshot,
+  index,
 }: {
   msg: Msg;
   workspace: string;
   getScreenshot?: (toolCallId?: string) => string | undefined;
+  index?: number;
 }) {
   const [speaking, setSpeaking] = useState(false);
   const [audioSrc, setAudioSrc] = useState<string | null>(null);
@@ -74,7 +76,7 @@ export default function Message({
 
   if (msg.role === "user") {
     return (
-      <div className="msg msg-user" dir="auto">
+      <div className="msg msg-user" dir="auto" style={{ "--m-i": index ?? 0 } as React.CSSProperties}>
         {msg.images && msg.images.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
             {msg.images.map((img, i) => (
@@ -99,7 +101,7 @@ export default function Message({
   if (!msg.content && msg.tool_calls?.length) return null; // tool-only step; cards follow
 
   return (
-    <div className="msg msg-assistant" dir="auto">
+    <div className="msg msg-assistant" dir="auto" style={{ "--m-i": index ?? 0 } as React.CSSProperties}>
       <div className="markdown-body">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}

@@ -20,6 +20,15 @@ export type Provider = {
   imageModel?: string;
   audioModel?: string;
   videoModel?: string;
+  // Whether this provider's chat endpoint accepts image content in
+  // messages (OpenAI-style image_url parts). Undefined means true (most
+  // OpenAI-compatible chat endpoints do) — set false for providers whose
+  // configured models reject it outright (confirmed for Z.AI/GLM: sending
+  // image content 400s with "messages.content.type is invalid, allowed
+  // values: ['text']"). When false, pasted/attached images are saved to a
+  // temp file and referenced by path in plain text instead (see agent.ts),
+  // so a vision-capable MCP tool can still be used on them.
+  supportsVision?: boolean;
 };
 
 const PROVIDERS_KEY = "mahi_providers";
@@ -47,6 +56,7 @@ export function defaultProviders(): Provider[] {
       models: ["glm-4.7", "glm-4.7-air", "glm-4.6"],
       consoleURL: "https://z.ai",
       roles: ["chat"],
+      supportsVision: false,
     },
   ];
 }
@@ -112,12 +122,22 @@ export function withLocalProvider(list: Provider[]): Provider[] {
   return [...list.filter((p) => p.id !== LOCAL_PROVIDER_ID), localProvider()];
 }
 
+// Migration for provider lists saved before supportsVision existed: the
+// built-in "zai" entry predates it, so an old localStorage snapshot has it
+// missing (undefined), which the gating check in agent.ts reads as "true" —
+// silently re-breaking the exact bug this field exists to prevent. Force it
+// explicitly for that one known-id rather than relying on the field being
+// present in whatever was persisted.
+function migrateVisionFlag(list: Provider[]): Provider[] {
+  return list.map((p) => (p.id === "zai" && p.supportsVision === undefined ? { ...p, supportsVision: false } : p));
+}
+
 export function loadProviders(): Provider[] {
   try {
     const raw = localStorage.getItem(PROVIDERS_KEY);
     if (!raw) return withLocalProvider(defaultProviders());
     const parsed: Provider[] = JSON.parse(raw);
-    return withLocalProvider(parsed.length ? parsed : defaultProviders());
+    return withLocalProvider(migrateVisionFlag(parsed.length ? parsed : defaultProviders()));
   } catch {
     return withLocalProvider(defaultProviders());
   }

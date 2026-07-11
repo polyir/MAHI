@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { ReasoningEffort } from "../agent";
 import { t, dir, useLang, getLang, setLang, LANGS, Lang } from "../ide/i18n";
 import { useModalOpen } from "../ide/modalTracker";
@@ -23,6 +24,15 @@ export default function SettingsModal({
   useLang();
   useModalOpen(true);
   const [local, setLocal] = useState<SessionSettings>(settings);
+  // Read at runtime rather than imported from package.json/tauri.conf.json
+  // directly — this reflects whatever build is ACTUALLY running right now,
+  // which is exactly the point: it's the one place to confirm an update
+  // really took effect (a self-update swaps the binary but there's
+  // otherwise no visible difference to check against).
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(""));
+  }, []);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -98,7 +108,12 @@ export default function SettingsModal({
           {t("autoApprove")}
         </label>
 
-        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", alignItems: "center" }}>
+          {appVersion && (
+            <span style={{ fontSize: 11, opacity: 0.5, marginInlineEnd: "auto" }} dir="ltr">
+              MAHI v{appVersion}
+            </span>
+          )}
           <button onClick={onClose}>{t("cancel")}</button>
           <button
             className="primary"

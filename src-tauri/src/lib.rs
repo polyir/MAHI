@@ -2,6 +2,7 @@ mod asr;
 mod browser;
 mod checkpoint;
 mod llm;
+mod mcp;
 mod media;
 mod models;
 mod pty;
@@ -465,6 +466,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(pty::PtyManager::default())
         .manage(checkpoint::CheckpointManager::default())
         .manage(models::ModelManager::default())
@@ -479,6 +482,7 @@ pub fn run() {
             screenshot::window_screenshot,
             write_file,
             media::write_file_binary,
+            media::save_temp_image,
             edit_file,
             delete_file,
             move_file,
@@ -512,6 +516,9 @@ pub fn run() {
             browser::browser_close,
             browser::browser_start_picker,
             browser::browser_stop_picker,
+            browser::browser_capture_element_screenshot,
+            mcp::mcp_list_tools,
+            mcp::mcp_call_tool,
             open_console_window
         ])
         .build(tauri::generate_context!())

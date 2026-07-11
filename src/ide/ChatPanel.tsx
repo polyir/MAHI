@@ -20,6 +20,9 @@ import {
   FlaskConical,
   Check,
   X,
+  Network,
+  SlidersHorizontal,
+  Puzzle,
 } from "lucide-react";
 import {
   agentTurn,
@@ -43,12 +46,15 @@ import Message from "../components/Message";
 import ApprovalModal, { PendingApproval } from "../components/ApprovalModal";
 import SettingsModal, { SessionSettings } from "../components/SettingsModal";
 import PromptLabModal from "./PromptLabModal";
+import ProjectSettingsModal from "./ProjectSettingsModal";
+import VoiceWaveform from "./VoiceWaveform";
 import type { Session } from "./sessions";
 import { loadSessions, loadSessionsFromFile, saveSessionsToFile, newSession, SESSIONS_KEY, ACTIVE_KEY } from "./sessions";
 import type { Project } from "./projects";
 import { loadProjects, saveProjects, loadActiveProjectId, saveActiveProjectId, newProject } from "./projects";
 import type { Provider } from "./providers";
 import { LOCAL_PROVIDER_ID } from "./providers";
+import type { McpServer } from "./mcp";
 import {
   loadLocalCtxOverride,
   localPromptBudget,
@@ -91,6 +97,8 @@ const TREE_MUTATION_TOOLS = new Set([
 export default function ChatPanel({
   provider,
   providers,
+  mcpServers,
+  onMcpServersChange,
   model,
   workspace,
   onFileChanged,
@@ -105,6 +113,8 @@ export default function ChatPanel({
 }: {
   provider: Provider;
   providers: Provider[];
+  mcpServers: McpServer[];
+  onMcpServersChange: (s: McpServer[]) => void;
   model: string;
   workspace: string;
   onFileChanged: (relPath: string) => void;
@@ -156,15 +166,59 @@ export default function ChatPanel({
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showPromptLab, setShowPromptLab] = useState(false);
+  const [showProjectSettings, setShowProjectSettings] = useState(false);
+  // Groups the model-routing switch and per-server MCP toggles into one
+  // popover instead of a growing row of individual icons — same reasoning
+  // as consolidating provider settings vs project settings: one clear entry
+  // point for "what extra capabilities does this message have" rather than
+  // one icon per capability.
+  const [showCapabilities, setShowCapabilities] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [pickedElement, setPickedElement] = useState<{ tag: string; text: string; selector: string } | null>(null);
   const [elementComment, setElementComment] = useState("");
+  // Screenshot of the picked element, cropped from an OS-level window
+  // capture (see browser_capture_element_screenshot) and downscaled through
+  // the same fileToCompressedDataUrl pipeline as pasted images. Kept
+  // separate from pastedImages until confirm, so the user can drop just the
+  // screenshot (some models/endpoints don't accept image input) while
+  // keeping the text reference.
+  const [pickedScreenshot, setPickedScreenshot] = useState<string | null>(null);
+  const [screenshotCapturing, setScreenshotCapturing] = useState(false);
   const [pastedImages, setPastedImages] = useState<string[]>([]);
+  // Per-session switch for the call_model tool (cross-model delegation) —
+  // see agent.ts's buildCallModelTool/runCallModelTool. Re-initialized from
+  // the active project's permanently-trusted flag whenever the project
+  // changes (below), but can still be toggled independently within a
+  // session without touching that persisted flag.
+  const [allowModelRouting, setAllowModelRouting] = useState(false);
+  const [showRoutingConfirm, setShowRoutingConfirm] = useState(false);
+  const [routingConfirmKeep, setRoutingConfirmKeep] = useState(false);
+  // Sending while the switch is on but the project isn't yet trusted asks
+  // once via the popup; this ref remembers "already confirmed this
+  // session" without the stale-closure risk a state variable would have
+  // right after the popup's own confirm handler flips it (see send()).
+  const routingConfirmedRef = useRef(false);
   const [fileDragOver, setFileDragOver] = useState(false);
   const [recording, setRecording] = useState(false);
   const [micConnecting, setMicConnecting] = useState(false);
   const [transcribingMic, setTranscribingMic] = useState(false);
+  // The live MediaStream while recording, for VoiceWaveform — state (not
+  // just a ref) since mounting/unmounting the waveform needs a re-render.
+  const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  // Hover-prewarm: getUserMedia's own device negotiation is what actually
+  // eats the first seconds of a recording (confirmed by the waveform now
+  // staying flat during that gap) — starting it a little earlier, on
+  // hover rather than on the click itself, gives it a head start. Only
+  // attempted when the OS has already granted mic access before (checked
+  // via the Permissions API), specifically so this never triggers a
+  // surprise permission prompt just from hovering the button.
+  const prewarmedStreamRef = useRef<MediaStream | null>(null);
+  useEffect(() => {
+    return () => {
+      prewarmedStreamRef.current?.getTracks().forEach((tr) => tr.stop());
+    };
+  }, []);
   const [improving, setImproving] = useState(false);
   const [preparingAttachment, setPreparingAttachment] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>([]);
@@ -232,16 +286,31 @@ export default function ChatPanel({
   // global rather than scoped to a specific tab/project, since only one
   // ChatPanel is ever mounted at a time in this single-pane layout.
   useEffect(() => {
-    const unlisten = listen<{ tabId: string; tag: string; text: string; selector: string }>(
-      "browser-element-picked",
-      (e) => {
-        setPickedElement({ tag: e.payload.tag, text: e.payload.text, selector: e.payload.selector });
-        setElementComment("");
-      }
-    );
+    const unlisten = listen<{
+      tabId: string;
+      tag: string;
+      text: string;
+      selector: string;
+      rectX: number;
+      rectY: number;
+      rectW: number;
+      rectH: number;
+    }>("browser-element-picked", (e) => {
+      setPickedElement({ tag: e.payload.tag, text: e.payload.text, selector: e.payload.selector });
+      setElementComment("");
+      setPickedScreenshot(null);
+      setScreenshotCapturing(true);
+      captureElementScreenshot(e.payload.tabId, {
+        x: e.payload.rectX,
+        y: e.payload.rectY,
+        w: e.payload.rectW,
+        h: e.payload.rectH,
+      });
+    });
     return () => {
       unlisten.then((un) => un());
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // One-time migration off localStorage (see sessions.ts) — on the first
   // launch after upgrading, the file doesn't exist yet, so `sessions` stays
@@ -278,6 +347,16 @@ export default function ChatPanel({
       setSessions((cur) => [s, ...cur]);
       setActiveId(s.id);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectId]);
+
+  // Switching projects starts the routing switch from that project's own
+  // permanently-trusted flag, and forgets any "confirmed this session" state
+  // from whatever project was active before — a trust decision for one
+  // project must never silently carry over to another.
+  useEffect(() => {
+    setAllowModelRouting(!!activeProject?.allowModelRouting);
+    routingConfirmedRef.current = false;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProjectId]);
 
@@ -548,14 +627,17 @@ export default function ChatPanel({
     const note = elementComment.trim();
     const line = note ? `${ref} ${note}` : ref;
     setInput((cur) => (cur.trim() ? `${cur}\n${line}` : line));
+    if (pickedScreenshot) setPastedImages((cur) => [...cur, pickedScreenshot]);
     setPickedElement(null);
     setElementComment("");
+    setPickedScreenshot(null);
     inputRef.current?.focus();
   }
 
   function cancelElementPick() {
     setPickedElement(null);
     setElementComment("");
+    setPickedScreenshot(null);
   }
 
   // Dropped from the file tree, which is always rooted at `workspace` — only
@@ -603,6 +685,36 @@ export default function ChatPanel({
     return canvas.toDataURL("image/jpeg", quality);
   }
 
+  // Crops a screenshot of just the picked element (see
+  // browser_capture_element_screenshot in browser.rs — an OS-level window
+  // capture, not a <canvas> read, so it works for cross-origin content and
+  // iframes too). The element's rect comes from the page's own
+  // getBoundingClientRect() (CSS px); browser.rs expects physical pixels to
+  // match wv.position(), so it's scaled by devicePixelRatio here first, same
+  // convention BrowserTabView.tsx already uses for positioning the webview.
+  async function captureElementScreenshot(
+    tabId: string,
+    rect: { x: number; y: number; w: number; h: number }
+  ) {
+    const dpr = window.devicePixelRatio || 1;
+    try {
+      const base64 = await invoke<string>("browser_capture_element_screenshot", {
+        tabId,
+        rectX: rect.x * dpr,
+        rectY: rect.y * dpr,
+        rectW: rect.w * dpr,
+        rectH: rect.h * dpr,
+      });
+      const blob = await (await fetch(`data:image/png;base64,${base64}`)).blob();
+      const compressed = await fileToCompressedDataUrl(new File([blob], "element.png", { type: "image/png" }));
+      setPickedScreenshot(compressed);
+    } catch {
+      setPickedScreenshot(null);
+    } finally {
+      setScreenshotCapturing(false);
+    }
+  }
+
   async function onPasteInput(e: React.ClipboardEvent<HTMLTextAreaElement>) {
     const items = Array.from(e.clipboardData.items).filter((it) => it.type.startsWith("image/"));
     if (!items.length) return; // let normal text paste proceed
@@ -619,6 +731,29 @@ export default function ChatPanel({
     }
   }
 
+  // Only ever pre-warms when the OS has already granted mic access, so
+  // hovering the button can never itself trigger a permission prompt —
+  // that stays tied to an explicit click, same as before. Silently does
+  // nothing if the Permissions API is unavailable/unsupported (some
+  // webviews don't implement the "microphone" query) or access isn't
+  // granted yet; startRecording() falls back to a fresh getUserMedia call
+  // either way, so there's no behavior regression if this never fires.
+  async function prewarmMic() {
+    if (prewarmedStreamRef.current || recording || micConnecting) return;
+    try {
+      const status = await navigator.permissions.query({ name: "microphone" as PermissionName });
+      if (status.state !== "granted") return;
+      prewarmedStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      // Permissions API unsupported, or getUserMedia failed — fine, startRecording tries again.
+    }
+  }
+
+  function releasePrewarmedMic() {
+    prewarmedStreamRef.current?.getTracks().forEach((tr) => tr.stop());
+    prewarmedStreamRef.current = null;
+  }
+
   // Voice input: record with MediaRecorder, hand the clip to the same
   // transcribe_media/Whisper pipeline the "Transcribe" button uses (a real
   // file on disk, not a new code path), then append the transcript to
@@ -630,10 +765,15 @@ export default function ChatPanel({
     }
     // Feedback the instant the button is pressed — getUserMedia (and the
     // OS's own mic-activation indicator) can take a visible moment, and
-    // without this the button looked unresponsive for that whole gap.
+    // without this the button looked unresponsive for that whole gap. The
+    // waveform (see VoiceWaveform/micStream below) makes that gap visible
+    // too: bars stay flat until real audio is actually flowing, so it's
+    // obvious when to actually start talking instead of losing the first
+    // words to a mic that only looked ready.
     setMicConnecting(true);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = prewarmedStreamRef.current ?? (await navigator.mediaDevices.getUserMedia({ audio: true }));
+      prewarmedStreamRef.current = null; // ownership moves here; don't double-stop it on hover-out
       const mimeType = ["audio/mp4", "audio/webm", "audio/wav"].find((m) => MediaRecorder.isTypeSupported(m));
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       recordedChunksRef.current = [];
@@ -642,12 +782,14 @@ export default function ChatPanel({
       };
       recorder.onstop = () => {
         stream.getTracks().forEach((tr) => tr.stop());
+        setMicStream(null);
         void finishRecording(recorder.mimeType || mimeType || "audio/webm");
       };
       mediaRecorderRef.current = recorder;
       recorder.start();
       setMicConnecting(false);
       setRecording(true);
+      setMicStream(stream);
     } catch (e) {
       setMicConnecting(false);
       toast(`${t("micError")}: ${String(e)}`, "err");
@@ -739,7 +881,9 @@ export default function ChatPanel({
   // reuse one fetch per workspace instead of re-fetching every send.
   const treeCache = useRef<{ workspace: string; maxEntries: number; tree: string } | null>(null);
   async function buildSystemContent(): Promise<string> {
-    let systemContent = active.systemPrompt;
+    let systemContent = activeProject?.instructions
+      ? `${activeProject.instructions}\n\n${active.systemPrompt}`
+      : active.systemPrompt;
     try {
       // Local models have far smaller context windows than the cloud
       // providers this tree size was tuned for — a large workspace's tree
@@ -853,6 +997,8 @@ export default function ChatPanel({
         requestApproval,
         chatProvider: provider,
         allProviders: providers,
+        mcpServers,
+        allowModelRouting,
         browserControl,
         onScreenshot,
         // Opening a tab only makes sense when this chat's project is the
@@ -941,6 +1087,34 @@ export default function ChatPanel({
   }
 
   async function send() {
+    if (!input.trim() || busy) return;
+    // The switch being on isn't itself enough to send call_model to the
+    // model — unless this project is already permanently trusted (or this
+    // session already confirmed once), ask first. routingConfirmedRef (not
+    // state) avoids a stale-closure race: confirmRoutingAndSend below needs
+    // to proceed synchronously in the same tick it flips this, before any
+    // re-render would reflect a state update.
+    if (allowModelRouting && !activeProject?.allowModelRouting && !routingConfirmedRef.current) {
+      setShowRoutingConfirm(true);
+      return;
+    }
+    await doSend();
+  }
+
+  async function confirmRoutingAndSend() {
+    if (routingConfirmKeep) {
+      setProjects((cur) =>
+        cur.map((p) => (p.id === activeProjectId ? { ...p, allowModelRouting: true } : p))
+      );
+    } else {
+      routingConfirmedRef.current = true;
+    }
+    setShowRoutingConfirm(false);
+    setRoutingConfirmKeep(false);
+    await doSend();
+  }
+
+  async function doSend() {
     if (!input.trim() || busy) return;
     if (!provider.apiKey) {
       toast(`${t("enterApiKeyFor")} ${provider.name}`, "err");
@@ -1168,6 +1342,9 @@ export default function ChatPanel({
             <Trash2 size={13} />
           </button>
         )}
+        <button className="ghost" onClick={() => setShowProjectSettings(true)} title={t("projectSettingsTitle")}>
+          <SlidersHorizontal size={13} />
+        </button>
       </div>
 
       {showHistory && (
@@ -1219,7 +1396,7 @@ export default function ChatPanel({
         )}
         {active.messages.map((m, i) => (
           <div key={i}>
-            <Message msg={m} workspace={projectDir} getScreenshot={getScreenshot} />
+            <Message msg={m} workspace={projectDir} getScreenshot={getScreenshot} index={i} />
             {m.role === "user" && m.checkpointId !== undefined && turnHasMutations.has(m.checkpointId) && (
               <div style={{ textAlign: "start", marginTop: 4 }}>
                 <button className="revert-btn" onClick={() => revertTo(m.checkpointId!)}>
@@ -1231,14 +1408,19 @@ export default function ChatPanel({
         ))}
         {streamingText && (
           <div className="typing">
-            <Message msg={{ role: "assistant", content: streamingText }} workspace={projectDir} />
+            <Message msg={{ role: "assistant", content: streamingText }} workspace={projectDir} index={active.messages.length} />
           </div>
         )}
         {(busy || improving || preparingAttachment) && !streamingText && (
           <div
             style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--text-dim)", padding: "4px 4px" }}
           >
-            <FishLoader size={56} />
+            <div className="ripple-wrapper">
+              <div className="ripple-wave"></div>
+              <div className="ripple-wave"></div>
+              <div className="ripple-wave"></div>
+              <FishLoader size={56} />
+            </div>
             <span className="typing">
               {improving ? t("improving") : preparingAttachment ? t("summarizingAttachment") : notice || t("working")}
             </span>
@@ -1299,6 +1481,33 @@ export default function ChatPanel({
             <div style={{ fontSize: 11.5, opacity: 0.7 }} dir="ltr">
               {pickedElement.text ? `<${pickedElement.tag}> "${pickedElement.text}"` : `<${pickedElement.tag}>`}
             </div>
+            {(screenshotCapturing || pickedScreenshot) && (
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                {screenshotCapturing && (
+                  <span style={{ fontSize: 11, opacity: 0.6 }}>{t("inspectElementCapturing")}</span>
+                )}
+                {pickedScreenshot && (
+                  <>
+                    <img
+                      src={pickedScreenshot}
+                      alt=""
+                      style={{
+                        height: 22,
+                        width: 22,
+                        objectFit: "cover",
+                        borderRadius: 4,
+                        border: "1px solid var(--border-soft)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <button className="ghost" style={{ fontSize: 11 }} onClick={() => setPickedScreenshot(null)}>
+                      <X size={11} /> {t("inspectElementRemoveScreenshot")}
+                    </button>
+                    <span style={{ fontSize: 10.5, opacity: 0.55 }}>{t("inspectElementVisionHint")}</span>
+                  </>
+                )}
+              </div>
+            )}
             <div style={{ display: "flex", gap: 6 }}>
               <input
                 autoFocus
@@ -1386,20 +1595,94 @@ export default function ChatPanel({
           >
             <Wand2 size={15} className={improving ? "typing" : undefined} />
           </button>
+          <div style={{ position: "relative" }}>
+            <button
+              className="ghost"
+              onClick={() => setShowCapabilities((v) => !v)}
+              title={t("capabilitiesTitle")}
+              style={{ color: allowModelRouting || mcpServers.some((s) => s.enabled) ? "var(--accent)" : undefined }}
+            >
+              <Puzzle size={15} />
+            </button>
+            {showCapabilities && (
+              <div
+                dir="auto"
+                style={{
+                  position: "absolute",
+                  bottom: "calc(100% + 6px)",
+                  insetInlineStart: 0,
+                  width: 260,
+                  background: "var(--bg-1)",
+                  border: "1px solid var(--border-soft)",
+                  borderRadius: 10,
+                  padding: 10,
+                  boxShadow: "0 4px 16px rgba(0,0,0,0.3)",
+                  zIndex: 20,
+                }}
+              >
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: mcpServers.length ? 10 : 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={allowModelRouting}
+                    onChange={(e) => setAllowModelRouting(e.target.checked)}
+                  />
+                  <Network size={13} />
+                  {t("allowModelRoutingTitle")}
+                </label>
+                {mcpServers.length > 0 && (
+                  <>
+                    <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 6 }}>{t("mcpServersTitle")}</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {mcpServers.map((s) => (
+                        <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
+                          <input
+                            type="checkbox"
+                            checked={s.enabled}
+                            onChange={(e) =>
+                              onMcpServersChange(
+                                mcpServers.map((x) => (x.id === s.id ? { ...x, enabled: e.target.checked } : x))
+                              )
+                            }
+                          />
+                          {s.name}
+                        </label>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
-          <textarea
-            ref={inputRef}
-            rows={3}
-            dir="auto"
-            value={input}
-            disabled={busy || improving || preparingAttachment}
-            onChange={onInputChange}
-            onKeyDown={onKeyDown}
-            onPaste={onPasteInput}
-            placeholder={projectDir ? t("inputPlaceholder") : t("noProjectHint")}
-            style={{ flex: 1, resize: "none" }}
-          />
+          {recording ? (
+            <div
+              style={{
+                flex: 1,
+                display: "flex",
+                alignItems: "center",
+                padding: "0 10px",
+                minHeight: 68,
+                border: "1px solid var(--border-soft)",
+                borderRadius: 8,
+              }}
+            >
+              <VoiceWaveform stream={micStream} />
+            </div>
+          ) : (
+            <textarea
+              ref={inputRef}
+              rows={3}
+              dir="auto"
+              value={input}
+              disabled={busy || improving || preparingAttachment}
+              onChange={onInputChange}
+              onKeyDown={onKeyDown}
+              onPaste={onPasteInput}
+              placeholder={projectDir ? t("inputPlaceholder") : t("noProjectHint")}
+              style={{ flex: 1, resize: "none" }}
+            />
+          )}
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
             <button
               className={recording || micConnecting ? "danger" : "ghost"}
@@ -1414,6 +1697,10 @@ export default function ChatPanel({
               }
               disabled={transcribingMic || micConnecting || !projectDir}
               onClick={toggleRecording}
+              onMouseEnter={prewarmMic}
+              onMouseLeave={() => {
+                if (!recording) releasePrewarmedMic();
+              }}
             >
               <Mic size={15} className={recording || micConnecting || transcribingMic ? "typing" : undefined} />
             </button>
@@ -1492,6 +1779,37 @@ export default function ChatPanel({
           onClose={() => setShowPromptLab(false)}
           onInsert={(text) => setInput(text)}
         />
+      )}
+      {showProjectSettings && activeProject && (
+        <ProjectSettingsModal
+          project={activeProject}
+          onSave={(updated) => setProjects((cur) => cur.map((p) => (p.id === updated.id ? updated : p)))}
+          onClose={() => setShowProjectSettings(false)}
+        />
+      )}
+      {showRoutingConfirm && (
+        <div className="modal-overlay" onClick={() => setShowRoutingConfirm(false)}>
+          <div className="modal" dir={uiDir()} style={{ width: 420 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0 }}>{t("routingConfirmTitle")}</h3>
+            <div style={{ fontSize: 12.5, opacity: 0.8, marginBottom: 14, lineHeight: 1.7 }}>
+              {t("routingConfirmBody")}
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 16 }}>
+              <input
+                type="checkbox"
+                checked={routingConfirmKeep}
+                onChange={(e) => setRoutingConfirmKeep(e.target.checked)}
+              />
+              {t("routingConfirmKeepLabel")}
+            </label>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowRoutingConfirm(false)}>{t("cancel")}</button>
+              <button className="primary" onClick={confirmRoutingAndSend}>
+                {t("routingConfirmContinue")}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

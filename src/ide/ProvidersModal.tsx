@@ -11,6 +11,7 @@ import {
   isBrowserToolsEnabled,
   setBrowserToolsEnabled,
 } from "./providers";
+import { McpServer, McpTransport, newMcpServer, listMcpTools, invalidateMcpToolCache } from "./mcp";
 import {
   loadDictationModel,
   loadDictationProviderId,
@@ -35,10 +36,14 @@ export default function ProvidersModal({
   providers,
   onSave,
   onClose,
+  mcpServers,
+  onSaveMcp,
 }: {
   providers: Provider[];
   onSave: (p: Provider[]) => void;
   onClose: () => void;
+  mcpServers: McpServer[];
+  onSaveMcp: (s: McpServer[]) => void;
 }) {
   useLang();
   useModalOpen(true);
@@ -129,6 +134,54 @@ export default function ProvidersModal({
     }
   }
 
+  // ---- MCP servers ----
+  const [mcpLocal, setMcpLocal] = useState<McpServer[]>(() => mcpServers.map((s) => ({ ...s })));
+  const [mcpTest, setMcpTest] = useState<Record<string, { loading: boolean; tools?: string[]; error?: string }>>({});
+
+  function updateMcp(i: number, patch: Partial<McpServer>) {
+    setMcpLocal((cur) => cur.map((s, j) => (j === i ? { ...s, ...patch } : s)));
+  }
+
+  function addMcp() {
+    setMcpLocal((cur) => [...cur, newMcpServer()]);
+  }
+
+  function removeMcp(i: number) {
+    setMcpLocal((cur) => cur.filter((_, j) => j !== i));
+  }
+
+  function envToText(env?: Record<string, string>): string {
+    return Object.entries(env ?? {})
+      .map(([k, v]) => `${k}=${v}`)
+      .join("\n");
+  }
+
+  function textToEnv(text: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const line of text.split("\n")) {
+      const eq = line.indexOf("=");
+      if (eq === -1) continue;
+      const key = line.slice(0, eq).trim();
+      if (key) out[key] = line.slice(eq + 1).trim();
+    }
+    return out;
+  }
+
+  // Connects to the server right now (fresh handshake, see mcp.rs) and lists
+  // its tools — both a "does this actually work" check and what refreshes
+  // the cached tool list a running chat turn will use next.
+  async function testMcp(i: number) {
+    const s = mcpLocal[i];
+    setMcpTest((cur) => ({ ...cur, [s.id]: { loading: true } }));
+    invalidateMcpToolCache(s.id);
+    try {
+      const tools = await listMcpTools(s);
+      setMcpTest((cur) => ({ ...cur, [s.id]: { loading: false, tools: tools.map((t) => t.name) } }));
+    } catch (e) {
+      setMcpTest((cur) => ({ ...cur, [s.id]: { loading: false, error: String(e) } }));
+    }
+  }
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div
@@ -193,6 +246,147 @@ export default function ProvidersModal({
             <div style={{ fontSize: 11, opacity: 0.65, marginTop: 2 }}>{t("browserToolsHelp")}</div>
           </div>
         </label>
+
+        <div
+          style={{
+            marginBottom: 16,
+            padding: 10,
+            border: "1px solid var(--border-soft)",
+            borderRadius: 10,
+          }}
+        >
+          <div style={{ fontSize: 13, marginBottom: 4 }}>{t("mcpServersTitle")}</div>
+          <div style={{ fontSize: 11, opacity: 0.65, marginBottom: 10, lineHeight: 1.6 }}>{t("mcpServersNote")}</div>
+
+          {mcpLocal.map((s, i) => {
+            const test = mcpTest[s.id];
+            return (
+              <div
+                key={s.id}
+                style={{
+                  border: "1px solid var(--border-soft)",
+                  borderRadius: 8,
+                  padding: 10,
+                  marginBottom: 8,
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 8,
+                }}
+              >
+                <label style={{ fontSize: 11, opacity: 0.7 }}>
+                  {t("name")}
+                  <input
+                    style={{ width: "100%", marginTop: 3 }}
+                    value={s.name}
+                    onChange={(e) => updateMcp(i, { name: e.target.value })}
+                  />
+                </label>
+                <label style={{ fontSize: 11, opacity: 0.7 }}>
+                  {t("mcpTransport")}
+                  <select
+                    style={{ width: "100%", marginTop: 3 }}
+                    value={s.transport}
+                    onChange={(e) => updateMcp(i, { transport: e.target.value as McpTransport })}
+                  >
+                    <option value="http">HTTP</option>
+                    <option value="stdio">stdio</option>
+                  </select>
+                </label>
+
+                {s.transport === "http" ? (
+                  <>
+                    <label style={{ fontSize: 11, opacity: 0.7, gridColumn: "1 / -1" }}>
+                      {t("mcpUrl")}
+                      <input
+                        dir="ltr"
+                        style={{ width: "100%", marginTop: 3 }}
+                        value={s.url ?? ""}
+                        onChange={(e) => updateMcp(i, { url: e.target.value })}
+                      />
+                    </label>
+                    <label style={{ fontSize: 11, opacity: 0.7, gridColumn: "1 / -1" }}>
+                      {t("mcpApiKey")}
+                      <input
+                        dir="ltr"
+                        type="password"
+                        style={{ width: "100%", marginTop: 3 }}
+                        value={s.apiKey ?? ""}
+                        onChange={(e) => updateMcp(i, { apiKey: e.target.value })}
+                      />
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <label style={{ fontSize: 11, opacity: 0.7 }}>
+                      {t("mcpCommand")}
+                      <input
+                        dir="ltr"
+                        style={{ width: "100%", marginTop: 3 }}
+                        value={s.command ?? ""}
+                        onChange={(e) => updateMcp(i, { command: e.target.value })}
+                      />
+                    </label>
+                    <label style={{ fontSize: 11, opacity: 0.7 }}>
+                      {t("mcpArgs")}
+                      <input
+                        dir="ltr"
+                        style={{ width: "100%", marginTop: 3 }}
+                        value={(s.args ?? []).join(" ")}
+                        onChange={(e) => updateMcp(i, { args: e.target.value.split(/\s+/).filter(Boolean) })}
+                      />
+                    </label>
+                    <label style={{ fontSize: 11, opacity: 0.7, gridColumn: "1 / -1" }}>
+                      {t("mcpEnvVars")}
+                      <textarea
+                        dir="ltr"
+                        rows={2}
+                        style={{ width: "100%", marginTop: 3, fontFamily: "inherit", fontSize: 12 }}
+                        value={envToText(s.env)}
+                        onChange={(e) => updateMcp(i, { env: textToEnv(e.target.value) })}
+                      />
+                    </label>
+                  </>
+                )}
+
+                <label
+                  style={{
+                    gridColumn: "1 / -1",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    fontSize: 11.5,
+                  }}
+                >
+                  <input type="checkbox" checked={s.enabled} onChange={(e) => updateMcp(i, { enabled: e.target.checked })} />
+                  {t("mcpEnabled")}
+                </label>
+
+                <div style={{ gridColumn: "1 / -1", display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+                  <button className="ghost" disabled={test?.loading} onClick={() => testMcp(i)}>
+                    <RefreshCw size={13} className={test?.loading ? "typing" : undefined} /> {t("mcpListTools")}
+                  </button>
+                  <button className="ghost" style={{ color: "var(--red)" }} onClick={() => removeMcp(i)}>
+                    <Trash2 size={13} /> {t("del")}
+                  </button>
+                  {test?.tools && (
+                    <span style={{ fontSize: 11, opacity: 0.7 }} dir="ltr">
+                      {t("mcpToolsFound")}: {test.tools.join(", ")}
+                    </span>
+                  )}
+                  {test?.error && (
+                    <span style={{ fontSize: 11, color: "var(--red)" }} dir="ltr">
+                      {test.error}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+          <button onClick={addMcp}>
+            <Plus size={14} /> {t("mcpAddServer")}
+          </button>
+        </div>
 
         <div
           style={{
@@ -338,6 +532,23 @@ export default function ProvidersModal({
               />
             </label>
 
+            <label
+              style={{
+                gridColumn: "1 / -1",
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: 11.5,
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={p.supportsVision !== false}
+                onChange={(e) => update(i, { supportsVision: e.target.checked })}
+              />
+              {t("providerSupportsVision")}
+            </label>
+
             <div style={{ gridColumn: "1 / -1", display: "flex", flexWrap: "wrap", gap: 6 }}>
               {PROVIDER_ROLES.map((role) => {
                 const checked = (p.roles ?? ["chat"]).includes(role);
@@ -437,6 +648,7 @@ export default function ProvidersModal({
             className="primary"
             onClick={() => {
               onSave(local.filter((p) => p.baseURL.startsWith("https://") && p.models.length));
+              onSaveMcp(mcpLocal);
               onClose();
             }}
           >
