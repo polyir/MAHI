@@ -385,7 +385,7 @@ body {
 }
 .stagger-item {
   animation: stagger-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
-  animation-delay: calc(var(--i) * 20ms);
+  animation-delay: calc(min(8, var(--i, 0)) * 12ms);
 }
 .context-menu {
   background: var(--bg-3);
@@ -585,7 +585,7 @@ select:focus {
 }
 .msg {
   animation: stagger-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
-  animation-delay: calc(var(--m-i, 0) * 45ms);
+  animation-delay: calc(min(5, var(--m-i, 0)) * 20ms);
   max-width: 100%;
   min-width: 0;
 }

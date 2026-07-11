@@ -1047,11 +1047,24 @@ export async function agentTurn(
       history.map(async (m) => {
         if (m.role === "assistant") {
           const out: any = { role: "assistant", content: m.content };
-          if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
+          if (m.tool_calls?.length) {
+            out.tool_calls = m.tool_calls;
+            // A tool-only assistant turn has content "" here. Gemini's
+            // OpenAI-compat endpoint is strict and rejects an empty string on
+            // an assistant message that carries tool_calls with a bare 400
+            // (no body) — it expects null. This is exactly the failure that
+            // only surfaces on the SECOND call of a turn, once the tool-call
+            // assistant message is echoed back in history. Other providers
+            // (e.g. Sakana) accept null too, so this is safe everywhere.
+            if (!m.content) out.content = null;
+          }
           return out;
         }
         if (m.role === "tool") {
-          return { role: "tool", tool_call_id: m.tool_call_id, content: m.content };
+          // Same strictness applies to tool results: an empty content string
+          // can be rejected. Send a short placeholder so no tool message ever
+          // leaves with an empty body.
+          return { role: "tool", tool_call_id: m.tool_call_id, content: m.content || "(no output)" };
         }
         if (m.images?.length) {
           if (supportsVision) {
