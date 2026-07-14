@@ -15,6 +15,8 @@ import {
   Video,
   Globe,
   Camera,
+  Captions,
+  Volume2,
 } from "lucide-react";
 import { Msg } from "../agent";
 import DiffView from "./DiffView";
@@ -38,6 +40,10 @@ const TOOL_ICONS: Record<string, React.ReactNode> = {
   browser_navigate: <Globe size={13} />,
   browser_close: <Globe size={13} />,
   browser_screenshot: <Camera size={13} />,
+  open_file_in_editor: <FileText size={13} />,
+  view_screen: <Camera size={13} />,
+  transcribe_media: <Captions size={13} />,
+  speak_text: <Volume2 size={13} />,
 };
 
 function summarize(name: string, args: any): string {
@@ -69,6 +75,14 @@ function summarize(name: string, args: any): string {
       return `browser_close ${args?.tab_id ?? "(active tab)"}`;
     case "browser_screenshot":
       return "browser_screenshot";
+    case "open_file_in_editor":
+      return `open_file_in_editor ${args?.path ?? ""}`;
+    case "view_screen":
+      return "view_screen";
+    case "transcribe_media":
+      return `transcribe_media ${args?.path ?? ""}`;
+    case "speak_text":
+      return `speak_text → ${args?.path ?? ""}`;
     default:
       return name;
   }
@@ -140,20 +154,41 @@ export default function ToolCallView({
             </pre>
           )}
           {name === "generate_image" && !isError && <ImagePreview workspace={workspace} path={args.path} />}
-          {name === "generate_audio" && !isError && (
+          {(name === "generate_audio" || name === "speak_text") && !isError && (
             <MediaPreview workspace={workspace} path={args.path} kind="audio" />
           )}
-          {name === "browser_screenshot" && !isError && screenshot && (
+          {name === "transcribe_media" && !isError && (
+            <pre style={{ fontSize: 11.5, margin: 0, maxHeight: 240, overflow: "auto", whiteSpace: "pre-wrap" }}>
+              {(() => {
+                try {
+                  return JSON.parse(msg.content).text;
+                } catch {
+                  return msg.content;
+                }
+              })()}
+            </pre>
+          )}
+          {(name === "browser_screenshot" || name === "view_screen") && !isError && screenshot && (
             <img
               src={`data:image/png;base64,${screenshot}`}
               alt="screenshot"
               style={{ maxWidth: "100%", borderRadius: 6, display: "block" }}
             />
           )}
-          {name === "browser_screenshot" && !isError && !screenshot && (
+          {(name === "browser_screenshot" || name === "view_screen") && !isError && !screenshot && (
             <div style={{ fontSize: 11.5, opacity: 0.6 }}>{msg.content}</div>
           )}
-          {(["list_dir", "glob_files", "search_files", "delete_file", "move_file", "browser_open", "browser_navigate", "browser_close"].includes(name) ||
+          {([
+            "list_dir",
+            "glob_files",
+            "search_files",
+            "delete_file",
+            "move_file",
+            "browser_open",
+            "browser_navigate",
+            "browser_close",
+            "open_file_in_editor",
+          ].includes(name) ||
             (name === "run_command" && !parsedRunResult) ||
             name === "generate_video" ||
             isError) && (

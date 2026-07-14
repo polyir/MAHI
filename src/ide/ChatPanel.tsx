@@ -14,22 +14,76 @@ import {
   Briefcase,
   FolderPlus,
   Trash2,
+  Mic,
+  Wand2,
+  FlaskConical,
 } from "lucide-react";
-import { agentTurn, makeClient, Msg, Usage, sanitizeEffort, sanitizeHistory, compactHistory, BrowserControl } from "../agent";
+import {
+  agentTurn,
+  makeClient,
+  Msg,
+  Usage,
+  sanitizeEffort,
+  sanitizeHistory,
+  compactHistory,
+  BrowserControl,
+  estimateTokens,
+  historyChars,
+} from "../agent";
+import { isElevenLabsAsrEnabled, loadActiveAsrModel } from "./models";
+import { transcribeElevenLabs } from "./elevenlabs";
+import { GRAPHIFY_SYSTEM_NOTE, isGraphifyAvailable } from "./externalTools";
 import FishLoader from "./FishLoader";
 import { recordUsage } from "./limits";
 import { notifyTaskDone } from "./completion";
 import Message from "../components/Message";
 import ApprovalModal, { PendingApproval } from "../components/ApprovalModal";
 import SettingsModal, { SessionSettings } from "../components/SettingsModal";
+import PromptLabModal from "./PromptLabModal";
 import type { Session } from "./sessions";
-import { loadSessions, newSession, SESSIONS_KEY, ACTIVE_KEY } from "./sessions";
+import { loadSessions, loadSessionsFromFile, saveSessionsToFile, newSession, SESSIONS_KEY, ACTIVE_KEY } from "./sessions";
 import type { Project } from "./projects";
 import { loadProjects, saveProjects, loadActiveProjectId, saveActiveProjectId, newProject } from "./projects";
 import type { Provider } from "./providers";
-import { t, useLang, dir as uiDir } from "./i18n";
+import { LOCAL_PROVIDER_ID } from "./providers";
+import {
+  loadLocalCtxOverride,
+  localPromptBudget,
+  chatTitle,
+  cleanDictation,
+  dictationCleanupSystem,
+  improvePrompt,
+  improvePromptSystem,
+  isDictationCleanupEnabled,
+  isSuggestionsEnabled,
+  loadDictationModel,
+  loadDictationProviderId,
+  loadImproveModel,
+  loadImproveProviderId,
+  suggestReplies,
+  summarizeAttachment,
+  summarizeHistory,
+} from "./localLlm";
+import { t, useLang, dir as uiDir, getLang } from "./i18n";
 
 const MAX_ATTACH_CHARS = 8000;
+const TURN_MUTATION_TOOLS = new Set([
+  "write_file",
+  "edit_file",
+  "delete_file",
+  "move_file",
+  "generate_image",
+  "generate_audio",
+  "speak_text",
+]);
+const TREE_MUTATION_TOOLS = new Set([
+  "write_file",
+  "delete_file",
+  "move_file",
+  "generate_image",
+  "generate_audio",
+  "speak_text",
+]);
 
 export default function ChatPanel({
   provider,
@@ -41,6 +95,10 @@ export default function ChatPanel({
   onHeaders,
   toast,
   browserControl,
+  openTabs,
+  activeTabPath,
+  onOpenFileForAgent,
+  onOpenModels,
 }: {
   provider: Provider;
   providers: Provider[];
@@ -51,6 +109,15 @@ export default function ChatPanel({
   onHeaders: (headers: Record<string, string>) => void;
   toast: (text: string, kind?: "ok" | "err") => void;
   browserControl: BrowserControl;
+  // The IDE's own open tabs (independent of this chat's project — see the
+  // projectDir === workspace guard below), so the agent can be told about
+  // "the file I have open" and open new tabs itself.
+  openTabs: string[];
+  activeTabPath: string | null;
+  onOpenFileForAgent: (relPath: string, line?: number) => void;
+  // Opens Settings → Local AI Models — used when the user picks the local
+  // provider/model but hasn't downloaded it yet.
+  onOpenModels: () => void;
 }) {
   useLang();
   const [projects, setProjects] = useState<Project[]>(loadProjects);
@@ -85,9 +152,18 @@ export default function ChatPanel({
   const [notice, setNotice] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showPromptLab, setShowPromptLab] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [pastedImages, setPastedImages] = useState<string[]>([]);
+  const [recording, setRecording] = useState(false);
+  const [micConnecting, setMicConnecting] = useState(false);
+  const [transcribingMic, setTranscribingMic] = useState(false);
+  const [improving, setImproving] = useState(false);
+  const [preparingAttachment, setPreparingAttachment] = useState(false);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
   const [mentionOpen, setMentionOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const [projectFiles, setProjectFiles] = useState<string[]>([]);
@@ -146,15 +222,24 @@ export default function ChatPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+  // One-time migration off localStorage (see sessions.ts) — on the first
+  // launch after upgrading, the file doesn't exist yet, so `sessions` stays
+  // whatever the synchronous localStorage-based initializer above produced.
   useEffect(() => {
-    try {
-      localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
-    } catch (e) {
-      // Quota exceeded or similar — without this catch, an uncaught error
-      // here (there's no error boundary anywhere in the app) unmounts the
-      // whole React tree, which looks like the entire window going blank.
-      toast(`${t("saveError")}: ${String(e)}`, "err");
-    }
+    loadSessionsFromFile().then((fromFile) => {
+      if (fromFile && fromFile.length) setSessions(fromFile);
+    });
+  }, []);
+  useEffect(() => {
+    // Old localStorage copy is only cleared once a file write is actually
+    // confirmed — if it fails (disk full, permissions), the frozen
+    // localStorage snapshot from before this change stays as a backup.
+    saveSessionsToFile(sessions).then((ok) => {
+      if (ok) {
+        localStorage.removeItem(SESSIONS_KEY);
+        localStorage.removeItem("vibe_sessions");
+      }
+    });
   }, [sessions]);
   useEffect(() => localStorage.setItem(ACTIVE_KEY, activeId), [activeId]);
   useEffect(() => saveProjects(projects), [projects]);
@@ -179,6 +264,7 @@ export default function ChatPanel({
   useEffect(() => {
     setInputRaw(localStorage.getItem(`vibe_draft_${activeId}`) ?? "");
     setLastPromptTokens(0); // context gauge below has no reading for this chat yet
+    setSuggestions([]);
   }, [activeId]);
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -196,6 +282,12 @@ export default function ChatPanel({
     sessions.find((s) => s.id === activeId && s.projectId === activeProjectId) ??
     sessions.find((s) => s.projectId === activeProjectId) ??
     sessions[0];
+
+  // The local Qwen3 models have a real context window far smaller than any
+  // cloud contextBudget default — the gauge must reflect whichever is
+  // actually in effect for the currently selected provider/model.
+  const gaugeBudget =
+    provider.id === LOCAL_PROVIDER_ID ? localPromptBudget(model) : active.contextBudget || 200_000;
 
   function pickProjectFolder() {
     open({ directory: true, multiple: false }).then((dir) => {
@@ -229,6 +321,110 @@ export default function ChatPanel({
   }
   function addMessage(m: Msg) {
     setSessions((cur) => cur.map((s) => (s.id === active.id ? { ...s, messages: [...s.messages, m] } : s)));
+  }
+
+  // Builds the history actually sent to the API: a session with a
+  // local-model-generated `summary` gets that summary substituted for
+  // messages[0..summaryUpTo) as a synthetic user/assistant pair, with only
+  // the tail beyond it going through the usual per-turn compactHistory.
+  // The full transcript in session.messages is never touched — this only
+  // shapes what leaves the machine on the next call.
+  function outgoingHistory(session: Session): Msg[] {
+    if (!session.summary || !session.summaryUpTo) return compactHistory(session.messages);
+    const tail = session.messages.slice(session.summaryUpTo);
+    const summaryMsgs: Msg[] = [
+      { role: "user", content: `[Summary of the earlier conversation]\n${session.summary}` },
+      { role: "assistant", content: "Understood — I have the context from the summary above and will continue accordingly." },
+    ];
+    return [...summaryMsgs, ...compactHistory(tail)];
+  }
+
+  function serializeForSummary(messages: Msg[]): string {
+    return messages
+      .map((m) => {
+        if (m.role === "tool") return `[tool ${m.toolName ?? ""}] ${m.content.slice(0, 500)}`;
+        if (m.tool_calls?.length) return `assistant (called ${m.tool_calls.map((tc) => tc.function.name).join(", ")})`;
+        return `${m.role}: ${m.content.slice(0, 2000)}`;
+      })
+      .join("\n\n");
+  }
+
+  // Background history compaction: folds everything but the last 2 user
+  // turns into a running local-model summary, so a long chat's *raw*
+  // history sent to the API stays bounded instead of growing every single
+  // turn. Never blocks sending — runs after a turn completes, and any
+  // failure just leaves the existing summary/messages as they are (today's
+  // plain compactHistory still applies via outgoingHistory's fallback).
+  function maybeCompactHistory(session: Session) {
+    const userIdxs: number[] = [];
+    session.messages.forEach((m, i) => {
+      if (m.role === "user") userIdxs.push(i);
+    });
+    if (userIdxs.length < 3) return; // need ≥1 turn to summarize + 2 to keep raw
+    const newCutoff = userIdxs[userIdxs.length - 2];
+    const prevCutoff = session.summaryUpTo ?? 0;
+    if (newCutoff <= prevCutoff) return; // nothing new since the last summary
+    const unsummarized = session.messages.slice(prevCutoff, newCutoff);
+    if (estimateTokens(historyChars(unsummarized)) <= 3000) return;
+    // Cache-friendliness: only re-summarize once the unsummarized range has
+    // grown substantially, so the output prefix stays byte-stable between
+    // consecutive turns most of the time.
+    if (prevCutoff > 0 && newCutoff - prevCutoff < 0.5 * prevCutoff) return;
+    const sessionId = session.id;
+    summarizeHistory(serializeForSummary(unsummarized), session.summary).then((summary) => {
+      if (!summary) return;
+      setSessions((cur) =>
+        cur.map((s) => (s.id === sessionId ? { ...s, summary, summaryUpTo: newCutoff } : s))
+      );
+    });
+  }
+
+  // The prompt-improve model is independently configurable in Settings →
+  // Providers (see ProvidersModal) — it may be the local Qwen3 provider
+  // (handled by improvePrompt/localComplete) or any cloud provider the user
+  // already has an API key for. This is the cloud branch: a plain,
+  // non-streaming completion using the same rewrite instructions as the
+  // local path, so behavior is consistent regardless of which the user picks.
+  async function improveWithCloudProvider(p: Provider, model: string, draft: string, lang: string): Promise<string | null> {
+    try {
+      const client = makeClient(p.apiKey, p.baseURL);
+      const resp = await client.chat.completions.create({
+        model: model || p.models[0],
+        messages: [
+          { role: "system", content: improvePromptSystem(lang) },
+          { role: "user", content: draft.slice(0, 4000) },
+        ],
+        max_tokens: 700,
+        temperature: 0.2,
+      });
+      const text = resp.choices[0]?.message?.content;
+      return text?.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+  // Cloud-provider sibling of cleanDictation (localLlm.ts), for the
+  // dictation-cleanup picker in Settings → Providers — same rewrite
+  // instructions, just routed through a cloud chat-completions call instead
+  // of the local llama-server.
+  async function cleanDictationWithCloudProvider(p: Provider, model: string, text: string, lang: string): Promise<string | null> {
+    if (text.length > 2000) return null;
+    try {
+      const client = makeClient(p.apiKey, p.baseURL);
+      const resp = await client.chat.completions.create({
+        model: model || p.models[0],
+        messages: [
+          { role: "system", content: dictationCleanupSystem(lang) },
+          { role: "user", content: text },
+        ],
+        max_tokens: Math.max(200, Math.round(text.length * 1.3)),
+        temperature: 0.2,
+      });
+      const reply = resp.choices[0]?.message?.content;
+      return reply?.trim() || null;
+    } catch {
+      return null;
+    }
   }
   // The last API-reported prompt_tokens is the real, current size of the
   // conversation as billed by the provider — unlike active.usage.total_tokens
@@ -366,41 +562,205 @@ export default function ChatPanel({
     }
   }
 
+  // Voice input: record with MediaRecorder, hand the clip to the same
+  // transcribe_media/Whisper pipeline the "Transcribe" button uses (a real
+  // file on disk, not a new code path), then append the transcript to
+  // whatever's already typed rather than replacing it.
+  async function startRecording() {
+    if (!loadActiveAsrModel()) {
+      toast(t("noAsrModel"), "err");
+      return;
+    }
+    // Feedback the instant the button is pressed — getUserMedia (and the
+    // OS's own mic-activation indicator) can take a visible moment, and
+    // without this the button looked unresponsive for that whole gap.
+    setMicConnecting(true);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = ["audio/mp4", "audio/webm", "audio/wav"].find((m) => MediaRecorder.isTypeSupported(m));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      recordedChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach((tr) => tr.stop());
+        void finishRecording(recorder.mimeType || mimeType || "audio/webm");
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setMicConnecting(false);
+      setRecording(true);
+    } catch (e) {
+      setMicConnecting(false);
+      toast(`${t("micError")}: ${String(e)}`, "err");
+    }
+  }
+
+  function stopRecording() {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  }
+
+  async function finishRecording(mimeType: string) {
+    const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+    recordedChunksRef.current = [];
+    if (blob.size === 0) return;
+    setTranscribingMic(true);
+    const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("wav") ? "wav" : "m4a";
+    const recPath = `.mahi-mic/${Date.now()}.${ext}`;
+    try {
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      let binary = "";
+      for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
+      const base64Content = btoa(binary);
+      await invoke("write_file_binary", { workspace: projectDir, path: recPath, base64Content });
+      // Opt-in (Settings → Local AI Models): routes dictation through
+      // ElevenLabs's cloud speech-to-text instead of the local Whisper
+      // model. Falls back to local Whisper on any failure (bad/missing API
+      // key, network error) rather than losing the recording — the mic
+      // audio is already safely written to disk above either way.
+      const result = isElevenLabsAsrEnabled()
+        ? await (async () => {
+            try {
+              const r = await transcribeElevenLabs(blob);
+              return { text: r.text, detected_language: r.languageCode };
+            } catch (e) {
+              toast(`${t("elevenLabsAsrFailed")}: ${String(e)}`, "err");
+              return await invoke<{ text: string; detected_language: string | null }>("transcribe_media", {
+                workspace: projectDir,
+                path: recPath,
+                modelId: loadActiveAsrModel(),
+              });
+            }
+          })()
+        : // No `language` sent — let whisper.cpp actually detect the spoken
+          // language from the audio, instead of forcing whatever the UI
+          // happens to be set to. Forcing was causing e.g. English dictation
+          // to come back transcribed as Persian (whisper.cpp doesn't "listen
+          // harder" for the forced language, it just transcribes into that
+          // language/script regardless of what's actually spoken).
+          await invoke<{ text: string; detected_language: string | null }>("transcribe_media", {
+            workspace: projectDir,
+            path: recPath,
+            modelId: loadActiveAsrModel(),
+          });
+      const spokenLang = result.detected_language ?? getLang();
+      // Opt-in (Settings → Local AI Models): falls back to the raw Whisper
+      // output when off, or on any failure (no local model, timeout, etc.).
+      // Provider/model is independently configurable in Settings →
+      // Providers, same picker pattern as prompt-improve.
+      let cleaned = result.text;
+      if (isDictationCleanupEnabled()) {
+        const dictationProviderId = loadDictationProviderId();
+        const model = loadDictationModel();
+        const runClean =
+          dictationProviderId === LOCAL_PROVIDER_ID
+            ? cleanDictation(result.text, spokenLang, model)
+            : (() => {
+                const provider = providers.find((p) => p.id === dictationProviderId);
+                return provider ? cleanDictationWithCloudProvider(provider, model, result.text, spokenLang) : Promise.resolve(null);
+              })();
+        cleaned = (await runClean) ?? result.text;
+      }
+      setInput((cur) => (cur ? `${cur} ${cleaned}` : cleaned));
+    } catch (e) {
+      toast(`${t("transcribeError")}: ${String(e)}`, "err");
+    } finally {
+      setTranscribingMic(false);
+      invoke("delete_file", { workspace: projectDir, path: recPath }).catch(() => {});
+    }
+  }
+
+  function toggleRecording() {
+    if (recording) stopRecording();
+    else void startRecording();
+  }
+
   // The tree text is resent as part of the system message on every single
   // API call within a turn (these APIs are stateless), so keep it small and
   // reuse one fetch per workspace instead of re-fetching every send.
-  const treeCache = useRef<{ workspace: string; tree: string } | null>(null);
+  const treeCache = useRef<{ workspace: string; maxEntries: number; tree: string } | null>(null);
   async function buildSystemContent(): Promise<string> {
     let systemContent = active.systemPrompt;
     try {
-      if (treeCache.current?.workspace !== projectDir) {
-        const tree = await invoke<string>("project_tree", { workspace: projectDir, maxEntries: 120 });
-        treeCache.current = { workspace: projectDir, tree };
+      // Local models have far smaller context windows than the cloud
+      // providers this tree size was tuned for — a large workspace's tree
+      // alone can otherwise burn most (or all) of a small local model's
+      // budget before any real conversation happens.
+      const maxEntries = provider.id === LOCAL_PROVIDER_ID ? 40 : 120;
+      if (treeCache.current?.workspace !== projectDir || treeCache.current?.maxEntries !== maxEntries) {
+        const tree = await invoke<string>("project_tree", { workspace: projectDir, maxEntries });
+        treeCache.current = { workspace: projectDir, maxEntries, tree };
       }
       systemContent += `\n\nWorkspace root: ${projectDir}\nProject files (partial listing; use glob_files/list_dir for more):\n${treeCache.current.tree}`;
     } catch {
       // proceed without tree
     }
+    // Only meaningful when this chat's project is the folder actually open
+    // in the IDE — otherwise these tabs belong to an unrelated project.
+    if (projectDir === workspace && openTabs.length) {
+      systemContent += `\n\nCurrently open tabs in the IDE's editor/preview panel (the user can see these on screen): ${openTabs.join(", ")}`;
+      if (activeTabPath) systemContent += `\nActive/focused tab: ${activeTabPath}`;
+    }
+    if (await isGraphifyAvailable()) {
+      systemContent += `\n\n${GRAPHIFY_SYSTEM_NOTE}`;
+    }
     return systemContent;
   }
 
-  async function runTurn(history: Msg[], checkpointId: number | undefined) {
-    // Rebuild the client whenever the selected provider's endpoint/key
-    // changed since the last turn.
-    const clientSig = `${provider.baseURL}|${provider.apiKey}`;
-    if (!clientRef.current || clientSigRef.current !== clientSig) {
-      clientRef.current = makeClient(provider.apiKey, provider.baseURL);
-      clientSigRef.current = clientSig;
-    }
+  async function runTurn(
+    history: Msg[],
+    checkpointId: number | undefined,
+    opts?: { isFirstTurn?: boolean; firstUserText?: string }
+  ) {
     setBusy(true);
     turnStartRef.current = Date.now();
     setElapsedMs(0);
     setStreamingText("");
     setNotice("");
+    setSuggestions([]); // stale suggestions from the previous turn no longer apply
     const controller = new AbortController();
     abortRef.current = controller;
     let lastAssistantText = "";
     let wasManualStop = false;
+    let hadError = false;
+    // Whatever the last user message driving this turn is — used for the
+    // suggestion-chips call below; works for both send() and continueTurn()
+    // without either needing to pass it explicitly.
+    const lastUserMsg = [...history].reverse().find((m) => m.role === "user");
+
+    // The local provider has no real baseURL until the sidecar for this
+    // specific model is actually running — resolve it fresh each turn
+    // (cheap once warm; local_llm_ensure's hot path just checks the process
+    // is alive) rather than trusting whatever placeholder is on the object.
+    let resolvedBaseURL = provider.baseURL;
+    if (provider.id === LOCAL_PROVIDER_ID) {
+      setNotice(t("localStarting"));
+      try {
+        resolvedBaseURL = await invoke<string>("local_llm_ensure", {
+          modelId: model,
+          ctx: loadLocalCtxOverride(model) ?? undefined,
+        });
+      } catch (e) {
+        addMessage({ role: "assistant", content: t("localModelMissing") });
+        toast(String(e), "err");
+        onOpenModels();
+        setBusy(false);
+        setNotice("");
+        abortRef.current = null;
+        return;
+      }
+      setNotice("");
+    }
+
+    // Rebuild the client whenever the selected provider's endpoint/key
+    // changed since the last turn.
+    const clientSig = `${resolvedBaseURL}|${provider.apiKey}`;
+    if (!clientRef.current || clientSigRef.current !== clientSig) {
+      clientRef.current = makeClient(provider.apiKey, resolvedBaseURL);
+      clientSigRef.current = clientSig;
+    }
 
     try {
       await agentTurn(clientRef.current, model, projectDir, history, {
@@ -410,7 +770,7 @@ export default function ChatPanel({
         temperature: active.temperature,
         signal: controller.signal,
         checkpointId,
-        contextBudget: active.contextBudget || 200_000,
+        contextBudget: gaugeBudget,
         onDelta: (t) => setStreamingText(t),
         onHeaders,
         onNotice: (t) => setNotice(t),
@@ -420,7 +780,7 @@ export default function ChatPanel({
           if (m.role === "assistant" && m.content) lastAssistantText = m.content;
           if (
             m.role === "tool" &&
-            ["write_file", "edit_file", "delete_file", "move_file"].includes(m.toolName ?? "")
+            TURN_MUTATION_TOOLS.has(m.toolName ?? "")
           ) {
             // Only refresh the IDE's own file tree/tabs when this chat's
             // project happens to be the folder currently open in the IDE —
@@ -430,7 +790,7 @@ export default function ChatPanel({
               if (m.toolArgs?.from) onFileChanged(m.toolArgs.from);
               if (m.toolArgs?.to) onFileChanged(m.toolArgs.to);
             }
-            if (["write_file", "delete_file", "move_file"].includes(m.toolName ?? "")) {
+            if (TREE_MUTATION_TOOLS.has(m.toolName ?? "")) {
               treeCache.current = null; // structure changed; refetch next turn
             }
           }
@@ -441,12 +801,17 @@ export default function ChatPanel({
         allProviders: providers,
         browserControl,
         onScreenshot,
+        // Opening a tab only makes sense when this chat's project is the
+        // folder actually open in the IDE — otherwise there's no tab strip
+        // this could sensibly land in.
+        openFile: projectDir === workspace ? onOpenFileForAgent : undefined,
       });
     } catch (e: any) {
       if (e?.name === "AbortError" || controller.signal.aborted) {
         wasManualStop = true;
         addMessage({ role: "assistant", content: t("stoppedMsg") });
       } else {
+        hadError = true;
         addMessage({ role: "assistant", content: `${t("disconnectedPrefix")}: ${String(e?.message ?? e)}` });
         toast(t("disconnectToast"), "err");
       }
@@ -460,6 +825,64 @@ export default function ChatPanel({
       if (!wasManualStop) {
         notifyTaskDone(t("taskDoneTitle"), lastAssistantText.slice(0, 180) || t("taskDoneBody"));
       }
+      // Fire-and-forget: replace the provisional title (first 40 chars of
+      // the user's message) with a real one once the first reply lands.
+      // Guarded on the title still being the provisional one so this never
+      // clobbers a title the user renamed by hand in the meantime.
+      if (!wasManualStop && opts?.isFirstTurn && opts.firstUserText && lastAssistantText) {
+        const sessionId = active.id;
+        const provisionalTitle = opts.firstUserText.slice(0, 40);
+        chatTitle(opts.firstUserText, lastAssistantText).then((title) => {
+          if (!title) return;
+          setSessions((cur) =>
+            cur.map((s) => (s.id === sessionId && s.title === provisionalTitle ? { ...s, title } : s))
+          );
+        });
+      }
+      // Off by default (extra inference on every reply has a real
+      // battery/thermal cost) — only fires on a clean, complete turn.
+      if (!wasManualStop && !hadError && isSuggestionsEnabled() && lastUserMsg && lastAssistantText) {
+        suggestReplies(lastUserMsg.content, lastAssistantText).then((s) => {
+          if (s) setSuggestions(s);
+        });
+      }
+      // Fire-and-forget background compaction — reads the session fresh via
+      // the functional updater since this turn's own messages (added via
+      // addMessage/setSessions above) aren't reflected in the `active`
+      // closure captured when runTurn started.
+      if (!wasManualStop && !hadError) {
+        setSessions((cur) => {
+          const fresh = cur.find((s) => s.id === active.id);
+          if (fresh) maybeCompactHistory(fresh);
+          return cur;
+        });
+      }
+    }
+  }
+
+  // One-shot: replaces the draft with an improved version for review —
+  // never auto-sends. Triggered by its own dedicated button rather than a
+  // toggle on Send, so it's always a single, direct action.
+  async function runImproveNow() {
+    if (!input.trim() || improving) return;
+    setImproving(true);
+    const draft = input;
+    const improveProviderId = loadImproveProviderId();
+    const runImprove =
+      improveProviderId === LOCAL_PROVIDER_ID
+        ? improvePrompt(draft, getLang(), loadImproveModel())
+        : (() => {
+            const improveProvider = providers.find((p) => p.id === improveProviderId);
+            return improveProvider
+              ? improveWithCloudProvider(improveProvider, loadImproveModel(), draft, getLang())
+              : Promise.resolve(null);
+          })();
+    const improved = await runImprove.finally(() => setImproving(false));
+    if (improved) {
+      setInput(improved);
+      toast(t("promptImproved"));
+    } else {
+      toast(t("improveFailed"), "err");
     }
   }
 
@@ -474,13 +897,18 @@ export default function ChatPanel({
       return;
     }
 
+    const firstUserText = input;
     // Build user message: attachments are inlined as context blocks.
     let userContent = input;
     for (const path of attachments) {
       try {
         let content = await invoke<string>("read_file", { workspace: projectDir, path });
         if (content.length > MAX_ATTACH_CHARS) {
-          content = content.slice(0, MAX_ATTACH_CHARS) + "\n… (truncated)";
+          setPreparingAttachment(true);
+          const summary = await summarizeAttachment(path, content).finally(() => setPreparingAttachment(false));
+          content = summary
+            ? `${summary}\n\n[First 1500 characters of the file, verbatim]\n${content.slice(0, 1500)}`
+            : content.slice(0, MAX_ATTACH_CHARS) + "\n… (truncated)";
         }
         userContent += `\n\n[Attached file: ${path}]\n\`\`\`\n${content}\n\`\`\``;
       } catch {
@@ -505,12 +933,14 @@ export default function ChatPanel({
     const isFirst = !active.messages.some((m) => m.role === "user");
     const systemContent = await buildSystemContent();
     // Older turns' tool dumps get compacted before sending — they'd otherwise
-    // be re-billed on every internal call of this turn.
-    const history: Msg[] = [
+    // be re-billed on every internal call of this turn. outgoingHistory also
+    // substitutes any local-model-generated summary for the messages it
+    // covers (see maybeCompactHistory).
+    const history: Msg[] = sanitizeHistory([
       { role: "system", content: systemContent },
-      ...compactHistory(active.messages),
+      ...outgoingHistory(active),
       userMsg,
-    ];
+    ]);
 
     setSessions((cur) =>
       cur.map((s) =>
@@ -522,7 +952,7 @@ export default function ChatPanel({
     setInput("");
     setAttachments([]);
     setPastedImages([]);
-    await runTurn(history, checkpointId);
+    await runTurn(history, checkpointId, { isFirstTurn: isFirst, firstUserText });
   }
 
   // Resume an interrupted turn: rebuild the history from the saved session
@@ -556,7 +986,7 @@ export default function ChatPanel({
     };
     const history: Msg[] = sanitizeHistory([
       { role: "system", content: systemContent },
-      ...compactHistory(cleaned),
+      ...outgoingHistory({ ...active, messages: cleaned }),
       resumeMsg,
     ]);
 
@@ -601,7 +1031,7 @@ export default function ChatPanel({
       if (
         m.role === "tool" &&
         currentCp !== undefined &&
-        ["write_file", "edit_file", "delete_file", "move_file"].includes(m.toolName ?? "") &&
+        TURN_MUTATION_TOOLS.has(m.toolName ?? "") &&
         !m.content.startsWith("error:") &&
         !m.content.startsWith("Rejected")
       ) {
@@ -733,15 +1163,19 @@ export default function ChatPanel({
             <Message msg={{ role: "assistant", content: streamingText }} workspace={projectDir} />
           </div>
         )}
-        {busy && !streamingText && (
+        {(busy || improving || preparingAttachment) && !streamingText && (
           <div
             style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--text-dim)", padding: "4px 4px" }}
           >
             <FishLoader size={56} />
-            <span className="typing">{notice || t("working")}</span>
-            <span dir="ltr" style={{ opacity: 0.7, fontVariantNumeric: "tabular-nums" }}>
-              {formatElapsed(elapsedMs)}
+            <span className="typing">
+              {improving ? t("improving") : preparingAttachment ? t("summarizingAttachment") : notice || t("working")}
             </span>
+            {!improving && !preparingAttachment && (
+              <span dir="ltr" style={{ opacity: 0.7, fontVariantNumeric: "tabular-nums" }}>
+                {formatElapsed(elapsedMs)}
+              </span>
+            )}
           </div>
         )}
         {!busy && canContinue && (
@@ -798,13 +1232,57 @@ export default function ChatPanel({
           </div>
         )}
 
+        {suggestions.length > 0 && !busy && (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 7 }}>
+            {suggestions.map((s, i) => (
+              <span
+                key={i}
+                className="chip"
+                style={{ cursor: "pointer" }}
+                onClick={() => {
+                  setInput(s);
+                  setSuggestions([]);
+                  inputRef.current?.focus();
+                }}
+              >
+                {s}
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+          <button
+            className="ghost"
+            title={t("attachFile")}
+            onClick={() => {
+              setInput((c) => c + "@");
+              setMentionOpen(true);
+              setMentionQuery("");
+              inputRef.current?.focus();
+            }}
+          >
+            <AtSign size={15} />
+          </button>
+          <button className="ghost" title={t("promptLabButtonTitle")} onClick={() => setShowPromptLab(true)}>
+            <FlaskConical size={15} />
+          </button>
+          <button
+            className="ghost"
+            title={t("improveNowTitle")}
+            disabled={!input.trim() || improving || busy || preparingAttachment}
+            onClick={runImproveNow}
+          >
+            <Wand2 size={15} className={improving ? "typing" : undefined} />
+          </button>
+        </div>
         <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
           <textarea
             ref={inputRef}
             rows={3}
             dir="auto"
             value={input}
-            disabled={busy}
+            disabled={busy || improving || preparingAttachment}
             onChange={onInputChange}
             onKeyDown={onKeyDown}
             onPaste={onPasteInput}
@@ -813,23 +1291,27 @@ export default function ChatPanel({
           />
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
             <button
-              className="ghost"
-              title={t("attachFile")}
-              onClick={() => {
-                setInput((c) => c + "@");
-                setMentionOpen(true);
-                setMentionQuery("");
-                inputRef.current?.focus();
-              }}
+              className={recording || micConnecting ? "danger" : "ghost"}
+              title={
+                transcribingMic
+                  ? t("transcribing")
+                  : micConnecting
+                  ? t("micConnecting")
+                  : recording
+                  ? t("micStop")
+                  : t("micStart")
+              }
+              disabled={transcribingMic || micConnecting || !projectDir}
+              onClick={toggleRecording}
             >
-              <AtSign size={15} />
+              <Mic size={15} className={recording || micConnecting || transcribingMic ? "typing" : undefined} />
             </button>
             {busy ? (
               <button className="danger" onClick={stop} title={t("stop")}>
                 <Square size={14} />
               </button>
             ) : (
-              <button className="primary" onClick={send} title={`${t("send")} (Enter)`}>
+              <button className="primary" onClick={send} disabled={improving || preparingAttachment} title={`${t("send")} (Enter)`}>
                 <Send size={14} />
               </button>
             )}
@@ -838,18 +1320,18 @@ export default function ChatPanel({
         {lastPromptTokens > 0 && (
           <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }} dir="ltr">
             <span style={{ fontSize: 10.5, color: "var(--text-faint)", whiteSpace: "nowrap" }}>
-              {t("contextWindow")}: {formatK(lastPromptTokens)}/{formatK(active.contextBudget || 200_000)} (
-              {Math.min(100, Math.round((lastPromptTokens / (active.contextBudget || 200_000)) * 100))}%)
+              {t("contextWindow")}: {formatK(lastPromptTokens)}/{formatK(gaugeBudget)} (
+              {Math.min(100, Math.round((lastPromptTokens / gaugeBudget) * 100))}%)
             </span>
             <div style={{ flex: 1, height: 4, borderRadius: 2, background: "var(--bg-3)", overflow: "hidden" }}>
               <div
                 style={{
-                  width: `${Math.min(100, (lastPromptTokens / (active.contextBudget || 200_000)) * 100)}%`,
+                  width: `${Math.min(100, (lastPromptTokens / gaugeBudget) * 100)}%`,
                   height: "100%",
                   background:
-                    lastPromptTokens / (active.contextBudget || 200_000) > 0.9
+                    lastPromptTokens / gaugeBudget > 0.9
                       ? "var(--red)"
-                      : lastPromptTokens / (active.contextBudget || 200_000) > 0.7
+                      : lastPromptTokens / gaugeBudget > 0.7
                       ? "var(--amber)"
                       : "var(--accent)",
                 }}
@@ -890,6 +1372,14 @@ export default function ChatPanel({
           }}
           onClose={() => setShowSettings(false)}
           onSave={(s: SessionSettings) => updateActive(s)}
+        />
+      )}
+      {showPromptLab && (
+        <PromptLabModal
+          initialText={input}
+          providers={providers}
+          onClose={() => setShowPromptLab(false)}
+          onInsert={(text) => setInput(text)}
         />
       )}
     </div>

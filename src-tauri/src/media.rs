@@ -5,8 +5,13 @@ use std::fs;
 /// workspace-relative path. Kept separate from write_file because the
 /// content here is binary, not UTF-8 text.
 #[tauri::command]
-pub fn write_file_binary(workspace: String, path: String, base64_content: String) -> Result<(), String> {
+pub fn write_file_binary(
+    workspace: String,
+    path: String,
+    base64_content: String,
+) -> Result<(), String> {
     let p = crate::resolve(&workspace, &path)?;
+    crate::ensure_not_workspace_root(&workspace, &p)?;
     if let Some(parent) = p.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }

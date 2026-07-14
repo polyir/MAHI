@@ -34,3 +34,6 @@ MAHI icon.png
 
 # Local agent config
 .claude/
+
+# Test audio generated while developing the ElevenLabs TTS integration
+.mahi-speech/

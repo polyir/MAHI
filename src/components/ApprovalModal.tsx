@@ -42,7 +42,7 @@ export default function ApprovalModal({
             ? t("approvalDelete")
             : pending.toolName === "move_file"
             ? t("approvalMove")
-            : ["generate_image", "generate_audio", "generate_video"].includes(pending.toolName)
+            : ["generate_image", "generate_audio", "generate_video", "speak_text"].includes(pending.toolName)
             ? t("approvalGenerate")
             : ["browser_navigate", "browser_close"].includes(pending.toolName)
             ? t("approvalBrowser")
@@ -80,7 +80,7 @@ export default function ApprovalModal({
           </>
         )}
 
-        {["generate_image", "generate_audio", "generate_video"].includes(pending.toolName) && (
+        {["generate_image", "generate_audio", "generate_video", "speak_text"].includes(pending.toolName) && (
           <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>
             "{pending.args.prompt ?? pending.args.text}" → {pending.args.path}
           </pre>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import {
   Files,
@@ -12,6 +13,8 @@ import {
   FolderOpen,
   Command,
   Globe,
+  HardDrive,
+  Blocks,
 } from "lucide-react";
 import "./ide/monacoSetup";
 import FileTree from "./components/FileTree";
@@ -25,9 +28,12 @@ import SearchPanel from "./ide/SearchPanel";
 import { EditorTab, baseName } from "./ide/types";
 import { kindForPath, isBinaryKind } from "./ide/fileKind";
 import { getWindows, formatCountdown } from "./ide/limits";
-import { Provider, loadProviders, saveProviders, loadActiveProviderId, saveActiveProviderId, defaultProviders } from "./ide/providers";
+import { Provider, loadProviders, saveProviders, loadActiveProviderId, saveActiveProviderId, defaultProviders, withLocalProvider } from "./ide/providers";
 import ProvidersModal from "./ide/ProvidersModal";
+import ModelsModal from "./ide/ModelsModal";
+import ExternalToolsModal from "./ide/ExternalToolsModal";
 import { t, useLang } from "./ide/i18n";
+import { loadActiveAsrModel } from "./ide/models";
 import mahiLogo from "./assets/mahi.png";
 import "./App.css";
 
@@ -50,6 +56,8 @@ export default function App() {
   const [activeProviderId, setActiveProviderId] = useState<string>(loadActiveProviderId);
   const [model, setModel] = useState(localStorage.getItem("sakana_model") ?? "fugu");
   const [showProviders, setShowProviders] = useState(false);
+  const [showModels, setShowModels] = useState(false);
+  const [showExternalTools, setShowExternalTools] = useState(false);
   const [workspace, setWorkspace] = useState(localStorage.getItem("vibe_workspace") ?? "");
   const [recents, setRecents] = useState<string[]>(loadRecents);
   const [tabs, setTabs] = useState<EditorTab[]>([]);
@@ -66,6 +74,11 @@ export default function App() {
   const [goto, setGoto] = useState<GotoTarget | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [treeVersion, setTreeVersion] = useState(0);
+  // Bumped per-path whenever the filesystem watcher reports that path
+  // changed — used to cache-bust asset:// preview URLs (see fs-changed
+  // listener below) so a deleted-and-recreated file's stale cached preview
+  // doesn't linger.
+  const [fileVersions, setFileVersions] = useState<Record<string, number>>({});
   const [limitWindows, setLimitWindows] = useState(() => getWindows());
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
@@ -89,6 +102,26 @@ export default function App() {
   useEffect(() => {
     if (workspace) invoke("register_asset_scope", { workspace }).catch(() => {});
   }, [workspace]);
+  // Watches the workspace for changes MAHI didn't cause itself (Finder, a
+  // shell command, another app, a file deleted and recreated under the same
+  // name) — without this, the file tree and open previews only ever
+  // refreshed on the specific agent tool calls MAHI already knew to track.
+  useEffect(() => {
+    if (workspace) invoke("watch_workspace", { workspace }).catch(() => {});
+  }, [workspace]);
+  useEffect(() => {
+    const unlisten = listen<{ paths: string[] }>("fs-changed", (e) => {
+      setTreeVersion((v) => v + 1);
+      setFileVersions((cur) => {
+        const next = { ...cur };
+        for (const p of e.payload.paths) next[p] = (next[p] ?? 0) + 1;
+        return next;
+      });
+    });
+    return () => {
+      unlisten.then((un) => un());
+    };
+  }, []);
   useEffect(() => localStorage.setItem(RECENTS_KEY, JSON.stringify(recents)), [recents]);
 
   const activeProvider =
@@ -151,6 +184,31 @@ export default function App() {
       if (line) setGoto({ path: relPath, line, nonce: Date.now() });
     },
     [workspace, toast]
+  );
+
+  const transcribeFile = useCallback(
+    async (relPath: string) => {
+      const modelId = loadActiveAsrModel();
+      if (!modelId) {
+        toast(t("noAsrModel"), "err");
+        return;
+      }
+      try {
+        const result = await invoke<{ text: string }>("transcribe_media", {
+          workspace,
+          path: relPath,
+          modelId,
+          language: undefined,
+        });
+        const transcriptPath = `${relPath}.transcript.txt`;
+        await invoke("write_file", { workspace, path: transcriptPath, content: result.text });
+        setTreeVersion((v) => v + 1);
+        await openFile(transcriptPath);
+      } catch (e) {
+        toast(`${t("transcribeError")}: ${String(e)}`, "err");
+      }
+    },
+    [workspace, toast, openFile]
   );
 
   function selectFileTab(i: number) {
@@ -338,6 +396,12 @@ export default function App() {
         <button className="ghost" onClick={() => setShowProviders(true)} title={t("manageProviders")}>
           <KeyRound size={14} />
         </button>
+        <button className="ghost" onClick={() => setShowModels(true)} title={t("manageModels")}>
+          <HardDrive size={14} />
+        </button>
+        <button className="ghost" onClick={() => setShowExternalTools(true)} title={t("manageExternalTools")}>
+          <Blocks size={14} />
+        </button>
       </div>
 
       <div className="main">
@@ -440,6 +504,8 @@ export default function App() {
                     onCloseBrowser={closeBrowserTab}
                     onNavigateBrowser={navigateBrowserTab}
                     onNewBrowserTab={newBrowserTab}
+                    onTranscribe={transcribeFile}
+                    fileVersions={fileVersions}
                   />
                 </Panel>
                 {showTerminal && <PanelResizeHandle key="term-h" className="resize-v" />}
@@ -470,6 +536,10 @@ export default function App() {
                   onUsageChange={setTotalTokens}
                   onHeaders={setUsageHeaders}
                   toast={toast}
+                  openTabs={tabs.map((tb) => tb.path)}
+                  activeTabPath={tabs[activeIndex]?.path ?? null}
+                  onOpenFileForAgent={openFile}
+                  onOpenModels={() => setShowModels(true)}
                   browserControl={{
                     open: agentBrowserOpen,
                     navigate: agentBrowserNavigate,
@@ -528,11 +598,15 @@ export default function App() {
           providers={providers}
           onClose={() => setShowProviders(false)}
           onSave={(p) => {
-            setProviders(p);
-            if (!p.find((x) => x.id === activeProviderId) && p[0]) setActiveProviderId(p[0].id);
+            const withLocal = withLocalProvider(p);
+            setProviders(withLocal);
+            if (!withLocal.find((x) => x.id === activeProviderId) && withLocal[0]) setActiveProviderId(withLocal[0].id);
           }}
         />
       )}
+
+      {showModels && <ModelsModal onClose={() => setShowModels(false)} />}
+      {showExternalTools && <ExternalToolsModal onClose={() => setShowExternalTools(false)} />}
 
       <div className="toasts">
         {toasts.map((t) => (

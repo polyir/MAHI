@@ -1,7 +1,7 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
-import { X, Code, Eye, ArrowRightLeft, Globe, Plus, RotateCw } from "lucide-react";
+import { X, Code, Eye, ArrowRightLeft, Globe, Plus, RotateCw, Captions } from "lucide-react";
 import { langForPath } from "./monacoSetup";
 import { kindForPath, isBinaryKind } from "./fileKind";
 import { resolveDirection, setDirOverride } from "./textDirection";
@@ -34,6 +34,8 @@ export default function EditorArea({
   onCloseBrowser,
   onNavigateBrowser,
   onNewBrowserTab,
+  onTranscribe,
+  fileVersions,
 }: {
   workspace: string;
   tabs: EditorTab[];
@@ -49,8 +51,14 @@ export default function EditorArea({
   onCloseBrowser: (id: string) => void;
   onNavigateBrowser: (id: string, url: string) => void;
   onNewBrowserTab: () => void;
+  onTranscribe: (path: string) => Promise<void>;
+  // Bumped per-path by the filesystem watcher when that file actually
+  // changed on disk — busts the asset:// preview cache for exactly that
+  // file (see ImagePreview/MediaPreview/PdfPreview's cacheBust prop).
+  fileVersions: Record<string, number>;
 }) {
   useLang();
+  const [transcribing, setTranscribing] = useState(false);
   const active = tabs[activeIndex];
   const activeBrowserTab = browserTabs.find((b) => b.id === activeBrowserId) ?? null;
   const browserActive = activeBrowserTab !== null;
@@ -90,6 +98,7 @@ export default function EditorArea({
   const mode = active ? previewMode[active.path] ?? "rendered" : "rendered";
   const showModeToggle = !browserActive && RENDERABLE.has(kind);
   const showDirToggle = !browserActive && !!active && !isBinaryKind(kind);
+  const showTranscribe = !browserActive && !!active && (kind === "audio" || kind === "video");
   const resolvedDir = active ? resolveDirection(active.path, active.content) : "ltr";
 
   function toggleMode() {
@@ -107,14 +116,26 @@ export default function EditorArea({
     setPreviewMode((cur) => ({ ...cur, [path]: "raw" }));
   }
 
+  async function handleTranscribe() {
+    if (!active || transcribing) return;
+    setTranscribing(true);
+    try {
+      await onTranscribe(active.path);
+    } finally {
+      setTranscribing(false);
+    }
+  }
+
+  const cacheBust = active ? fileVersions[active.path] ?? 0 : 0;
+
   let body: React.ReactNode = null;
   if (active) {
     if (kind === "image") {
-      body = <ImagePreview workspace={workspace} path={active.path} />;
+      body = <ImagePreview workspace={workspace} path={active.path} cacheBust={cacheBust} />;
     } else if (kind === "audio" || kind === "video") {
-      body = <MediaPreview workspace={workspace} path={active.path} kind={kind} />;
+      body = <MediaPreview workspace={workspace} path={active.path} kind={kind} cacheBust={cacheBust} />;
     } else if (kind === "pdf") {
-      body = <PdfPreview workspace={workspace} path={active.path} />;
+      body = <PdfPreview workspace={workspace} path={active.path} cacheBust={cacheBust} />;
     } else if (kind === "markdown" && mode === "rendered") {
       body = <MarkdownPreview content={active.content} dir={resolvedDir} />;
     } else if (kind === "json" && mode === "rendered") {
@@ -207,7 +228,7 @@ export default function EditorArea({
         </div>
       </div>
 
-      {!browserActive && active && (showModeToggle || showDirToggle) && (
+      {!browserActive && active && (showModeToggle || showDirToggle || showTranscribe) && (
         <div className="preview-toolbar">
           {showModeToggle && (
             <button className="ghost" onClick={toggleMode} title={mode === "rendered" ? t("rawView") : t("renderedView")}>
@@ -217,6 +238,12 @@ export default function EditorArea({
           {showDirToggle && (
             <button className="ghost" onClick={toggleDirection} title={t("toggleDirection")}>
               <ArrowRightLeft size={13} /> {resolvedDir.toUpperCase()}
+            </button>
+          )}
+          {showTranscribe && (
+            <button className="ghost" onClick={handleTranscribe} disabled={transcribing} title={t("transcribeButton")}>
+              <Captions size={13} className={transcribing ? "typing" : undefined} />
+              {transcribing ? t("transcribing") : t("transcribeButton")}
             </button>
           )}
         </div>

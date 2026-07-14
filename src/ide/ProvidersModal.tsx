@@ -5,11 +5,22 @@ import {
   Provider,
   ProviderRole,
   PROVIDER_ROLES,
+  LOCAL_PROVIDER_ID,
   isRoleRoutingEnabled,
   setRoleRoutingEnabled,
   isBrowserToolsEnabled,
   setBrowserToolsEnabled,
 } from "./providers";
+import {
+  loadDictationModel,
+  loadDictationProviderId,
+  loadImproveModel,
+  loadImproveProviderId,
+  saveDictationModel,
+  saveDictationProviderId,
+  saveImproveModel,
+  saveImproveProviderId,
+} from "./localLlm";
 import { t, dir as uiDir, useLang, StrKey } from "./i18n";
 
 const ROLE_LABEL_KEY: Record<ProviderRole, StrKey> = {
@@ -29,9 +40,37 @@ export default function ProvidersModal({
   onClose: () => void;
 }) {
   useLang();
-  const [local, setLocal] = useState<Provider[]>(() => providers.map((p) => ({ ...p })));
+  // The built-in local-LLM provider is virtual/auto-managed — nothing to
+  // edit here (no baseURL/apiKey/models to configure), so it never appears
+  // in this editable list at all.
+  const [local, setLocal] = useState<Provider[]>(() =>
+    providers.filter((p) => p.id !== LOCAL_PROVIDER_ID).map((p) => ({ ...p }))
+  );
   const [routingEnabled, setRoutingEnabled] = useState(isRoleRoutingEnabled());
   const [browserToolsEnabled, setBrowserToolsEnabledState] = useState(isBrowserToolsEnabled());
+  // Independent of the main chat provider/model — which provider/model
+  // rewrites the draft when the chat header's Wand2 toggle is on. `providers`
+  // (unlike `local` above) still includes the virtual Local (Qwen3) entry,
+  // which is exactly what should be selectable here.
+  const [improveProviderId, setImproveProviderId] = useState(loadImproveProviderId());
+  const [improveModel, setImproveModel] = useState(loadImproveModel());
+  const improveProvider = providers.find((p) => p.id === improveProviderId) ?? providers[0];
+  // The stored model might not belong to the currently-selected provider
+  // (e.g. switched away and back, or the provider's own model list changed
+  // since it was picked) — fall back to that provider's first model rather
+  // than rendering a <select> with no matching <option>.
+  const improveModelSafe = improveProvider?.models.includes(improveModel)
+    ? improveModel
+    : improveProvider?.models[0] ?? "";
+  // Independent of the improve-prompt picker above — which provider/model
+  // cleans up the Whisper transcript when dictation cleanup is on (see
+  // Settings → Local AI Models).
+  const [dictationProviderId, setDictationProviderId] = useState(loadDictationProviderId());
+  const [dictationModel, setDictationModel] = useState(loadDictationModel());
+  const dictationProvider = providers.find((p) => p.id === dictationProviderId) ?? providers[0];
+  const dictationModelSafe = dictationProvider?.models.includes(dictationModel)
+    ? dictationModel
+    : dictationProvider?.models[0] ?? "";
 
   function update(i: number, patch: Partial<Provider>) {
     setLocal((cur) => cur.map((p, j) => (j === i ? { ...p, ...patch } : p)));
@@ -153,6 +192,98 @@ export default function ProvidersModal({
           </div>
         </label>
 
+        <div
+          style={{
+            marginBottom: 16,
+            padding: 10,
+            border: "1px solid var(--border-soft)",
+            borderRadius: 10,
+          }}
+        >
+          <div style={{ fontSize: 12.5, marginBottom: 8 }}>{t("improveModelLabel")}</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <select
+              value={improveProviderId}
+              onChange={(e) => {
+                const nextId = e.target.value;
+                const nextProvider = providers.find((p) => p.id === nextId);
+                const nextModel = nextProvider?.models[0] ?? "";
+                setImproveProviderId(nextId);
+                saveImproveProviderId(nextId);
+                setImproveModel(nextModel);
+                saveImproveModel(nextModel);
+              }}
+              style={{ flex: 1 }}
+            >
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            <select
+              value={improveModelSafe}
+              onChange={(e) => {
+                setImproveModel(e.target.value);
+                saveImproveModel(e.target.value);
+              }}
+              style={{ flex: 1 }}
+            >
+              {(improveProvider?.models ?? []).map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginBottom: 16,
+            padding: 10,
+            border: "1px solid var(--border-soft)",
+            borderRadius: 10,
+          }}
+        >
+          <div style={{ fontSize: 12.5, marginBottom: 8 }}>{t("dictationCleanupModelLabel")}</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <select
+              value={dictationProviderId}
+              onChange={(e) => {
+                const nextId = e.target.value;
+                const nextProvider = providers.find((p) => p.id === nextId);
+                const nextModel = nextProvider?.models[0] ?? "";
+                setDictationProviderId(nextId);
+                saveDictationProviderId(nextId);
+                setDictationModel(nextModel);
+                saveDictationModel(nextModel);
+              }}
+              style={{ flex: 1 }}
+            >
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            <select
+              value={dictationModelSafe}
+              onChange={(e) => {
+                setDictationModel(e.target.value);
+                saveDictationModel(e.target.value);
+              }}
+              style={{ flex: 1 }}
+            >
+              {(dictationProvider?.models ?? []).map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
         {local.map((p, i) => (
           <div
             key={p.id}
@@ -231,6 +362,7 @@ export default function ProvidersModal({
                 {t("roleImage")} model
                 <input
                   dir="ltr"
+                  list={`role-models-${i}`}
                   style={{ width: "100%", marginTop: 3 }}
                   placeholder={p.models[0] ?? ""}
                   value={p.imageModel ?? ""}
@@ -243,6 +375,7 @@ export default function ProvidersModal({
                 {t("roleAudio")} model
                 <input
                   dir="ltr"
+                  list={`role-models-${i}`}
                   style={{ width: "100%", marginTop: 3 }}
                   placeholder={p.models[0] ?? ""}
                   value={p.audioModel ?? ""}
@@ -255,12 +388,25 @@ export default function ProvidersModal({
                 {t("roleVideo")} model
                 <input
                   dir="ltr"
+                  list={`role-models-${i}`}
                   style={{ width: "100%", marginTop: 3 }}
                   placeholder={p.models[0] ?? ""}
                   value={p.videoModel ?? ""}
                   onChange={(e) => update(i, { videoModel: e.target.value })}
                 />
               </label>
+            )}
+            {((p.roles ?? []).includes("image") || (p.roles ?? []).includes("audio") || (p.roles ?? []).includes("video")) && (
+              // Native <datalist>: gives a real dropdown of the provider's
+              // already-fetched model list (see fetchModels/"دریافت مدل‌ها از
+              // سرویس" above) while still allowing free typing — some
+              // providers' image/audio/video model ids aren't part of the
+              // same /models listing used for the chat model field.
+              <datalist id={`role-models-${i}`}>
+                {p.models.map((m) => (
+                  <option key={m} value={m} />
+                ))}
+              </datalist>
             )}
 
             <div style={{ gridColumn: "1 / -1", display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8 }}>

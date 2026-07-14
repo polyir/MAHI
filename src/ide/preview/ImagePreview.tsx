@@ -3,9 +3,18 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { absolutePath } from "../fileKind";
 import { t } from "../i18n";
 
-export default function ImagePreview({ workspace, path }: { workspace: string; path: string }) {
+export default function ImagePreview({
+  workspace,
+  path,
+  cacheBust,
+}: {
+  workspace: string;
+  path: string;
+  cacheBust?: number;
+}) {
   const [error, setError] = useState(false);
-  const src = convertFileSrc(absolutePath(workspace, path));
+  const base = convertFileSrc(absolutePath(workspace, path));
+  const src = cacheBust ? `${base}?v=${cacheBust}` : base;
 
   if (error) {
     return <div style={{ padding: 14, fontSize: 12.5, opacity: 0.6 }}>{t("openError")}</div>;
