@@ -16,13 +16,19 @@ version — bump from the "Working tree" line below, following
 - **Version:** 2.7.0
 - **tsc:** clean
 - Built and installed to `/Applications/MAHI.app`: yes (2026-07-14)
-- Committed to git: **no** — HEAD is still `ea55c85` (1.3.6). Everything
-  from 1.3.7 through 2.7.0 is uncommitted working-tree state.
+- Committed to git: **yes** — `97caa46`, "Add unified Skills, provider
+  protocol adapters, studio MCP servers, Window Vision, and media
+  generation" (squashes 1.3.7 through 2.7.0). `assets/test_ai_generation_2.png`
+  and `generated/hyperframes-skill-logo.png` were left out of the commit —
+  unreferenced anywhere in source, flagged to the user as likely stray
+  test/debug output rather than silently committed or deleted; still sit
+  untracked in the working tree.
 
 ## Last git commit
 
-- `ea55c85` — "Fix Gemini null-content requirements and stagger-animation
-  delay overflow" — 2026-07-11 23:05 +0300 — shipped as 1.3.6.
+- `97caa46` — "Add unified Skills, provider protocol adapters, studio MCP
+  servers, Window Vision, and media generation" — 2026-07-14 — shipped as
+  2.7.0.
 
 ## Currently live on the update server
 
