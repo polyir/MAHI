@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 // Fixed-width scrolling amplitude history (not a live spectrum snapshot) —
 // matches the classic voice-input look: bars for older samples slide left
@@ -8,12 +9,38 @@ const BAR_COUNT = 48;
 const SAMPLE_INTERVAL_MS = 70;
 const MAX_BAR_HEIGHT = 26;
 
-export default function VoiceWaveform({ stream }: { stream: MediaStream | null }) {
+export default function VoiceWaveform({ stream, active = false }: { stream: MediaStream | null; active?: boolean }) {
   const barRefs = useRef<(HTMLDivElement | null)[]>([]);
   const levelsRef = useRef<number[]>(new Array(BAR_COUNT).fill(0));
 
   useEffect(() => {
-    if (!stream) return;
+    if (!stream) {
+      if (!active) return;
+      let cancelled = false;
+      let timer = 0;
+      const sample = async () => {
+        try {
+          const meter = await invoke<{ level: number; peak: number }>("microphone_level");
+          if (cancelled) return;
+          const levels = levelsRef.current;
+          levels.shift();
+          levels.push(Math.min(1, Math.max(0, meter.level * 0.7 + meter.peak * 0.3)));
+          for (let i = 0; i < BAR_COUNT; i++) {
+            const bar = barRefs.current[i];
+            if (bar) bar.style.height = `${Math.max(3, Math.round(levels[i] * MAX_BAR_HEIGHT))}px`;
+          }
+        } catch {
+          // Recording can stop between the last scheduled sample and unmount.
+        }
+        if (!cancelled) timer = window.setTimeout(sample, SAMPLE_INTERVAL_MS);
+      };
+      void sample();
+      return () => {
+        cancelled = true;
+        window.clearTimeout(timer);
+        levelsRef.current = new Array(BAR_COUNT).fill(0);
+      };
+    }
     const audioCtx = new AudioContext();
     const source = audioCtx.createMediaStreamSource(stream);
     const analyser = audioCtx.createAnalyser();
@@ -57,7 +84,7 @@ export default function VoiceWaveform({ stream }: { stream: MediaStream | null }
       levelsRef.current = new Array(BAR_COUNT).fill(0);
       paint();
     };
-  }, [stream]);
+  }, [stream, active]);
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 2, height: MAX_BAR_HEIGHT + 4, flex: 1, overflow: "hidden" }}>

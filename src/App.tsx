@@ -31,12 +31,20 @@ import { EditorTab, baseName } from "./ide/types";
 import { kindForPath, isBinaryKind } from "./ide/fileKind";
 import { getWindows, formatCountdown } from "./ide/limits";
 import { Provider, loadProviders, saveProviders, loadActiveProviderId, saveActiveProviderId, defaultProviders, withLocalProvider } from "./ide/providers";
-import { McpServer, loadMcpServers, saveMcpServers } from "./ide/mcp";
+import {
+  McpServer,
+  loadMcpServers,
+  saveMcpServers,
+  mergeStudioMcpServers,
+  STUDIO_MCP_DIR_KEY,
+} from "./ide/mcp";
+import { checkStudioMcpStatus } from "./ide/studioMcp";
 import { UpdateInfo, checkForUpdate, downloadUpdate, installDownloadedUpdate } from "./ide/updater";
 import ProvidersModal from "./ide/ProvidersModal";
 import ModelsModal from "./ide/ModelsModal";
 import { t, useLang } from "./ide/i18n";
 import { loadActiveAsrModel } from "./ide/models";
+import { resumePendingMediaJobs } from "./agent";
 import mahiLogo from "./assets/mahi.png";
 import "./App.css";
 
@@ -44,6 +52,7 @@ export type Toast = { id: number; text: string; kind: "ok" | "err" };
 export type GotoTarget = { path: string; line: number; nonce: number };
 
 const RECENTS_KEY = "vibe_recent_workspaces";
+const STUDIO_MCP_DISCOVERY_KEY = "mahi_studio_mcp_discovered";
 
 function loadRecents(): string[] {
   try {
@@ -70,6 +79,8 @@ export default function App() {
   const [sideView, setSideView] = useState<"files" | "search" | null>(null);
   const [showTerminal, setShowTerminal] = useState(false);
   const [showChat, setShowChat] = useState(true);
+  const [lowPowerMode, setLowPowerMode] = useState(() => localStorage.getItem("mahi_low_power_mode") === "1");
+  const mediaResumeRunning = useRef(false);
   // Panel arrangement toggles — quick swap buttons rather than free-form
   // drag-and-drop (a deliberately smaller feature than a full docking
   // system): chatOnLeft flips chat/editor left-right, sidebarBottomSwapped
@@ -85,6 +96,26 @@ export default function App() {
     () => localStorage.setItem("mahi_sidebar_bottom_swapped", sidebarBottomSwapped ? "1" : "0"),
     [sidebarBottomSwapped]
   );
+  useEffect(() => {
+    localStorage.setItem("mahi_low_power_mode", lowPowerMode ? "1" : "0");
+    document.documentElement.classList.toggle("low-power", lowPowerMode);
+    window.dispatchEvent(new Event("mahi-low-power-change"));
+  }, [lowPowerMode]);
+
+  useEffect(() => {
+    const syncActivity = () => {
+      document.documentElement.classList.toggle("app-inactive", document.hidden || !document.hasFocus());
+    };
+    syncActivity();
+    document.addEventListener("visibilitychange", syncActivity);
+    window.addEventListener("focus", syncActivity);
+    window.addEventListener("blur", syncActivity);
+    return () => {
+      document.removeEventListener("visibilitychange", syncActivity);
+      window.removeEventListener("focus", syncActivity);
+      window.removeEventListener("blur", syncActivity);
+    };
+  }, []);
   const [browserTabs, setBrowserTabs] = useState<BrowserTab[]>([]);
   const [activeBrowserId, setActiveBrowserId] = useState<string | null>(null);
   const [showUsage, setShowUsage] = useState(false);
@@ -164,7 +195,28 @@ export default function App() {
   useEffect(() => setLimitWindows(getWindows()), [totalTokens]);
 
   useEffect(() => saveProviders(providers), [providers]);
+  useEffect(() => {
+    if (mediaResumeRunning.current) return;
+    mediaResumeRunning.current = true;
+    resumePendingMediaJobs(providers)
+      .then((messages) => messages.forEach((message) => toast(message, message.includes("saved to") ? "ok" : "err")))
+      .finally(() => { mediaResumeRunning.current = false; });
+  }, [providers]);
   useEffect(() => saveMcpServers(mcpServers), [mcpServers]);
+  useEffect(() => {
+    // Discover a managed Studio bundle installed by an older build or by
+    // MAHI's installer before the presets were persisted. This runs once;
+    // afterwards a server the user deliberately removes stays removed.
+    if (localStorage.getItem(STUDIO_MCP_DISCOVERY_KEY) === "1") return;
+    checkStudioMcpStatus()
+      .then((status) => {
+        if (!status.installed || !status.dir) return;
+        localStorage.setItem(STUDIO_MCP_DIR_KEY, status.dir);
+        localStorage.setItem(STUDIO_MCP_DISCOVERY_KEY, "1");
+        setMcpServers((current) => mergeStudioMcpServers(current, status.dir));
+      })
+      .catch(() => {});
+  }, []);
   useEffect(() => saveActiveProviderId(activeProviderId), [activeProviderId]);
   useEffect(() => localStorage.setItem("sakana_model", model), [model]);
   useEffect(() => localStorage.setItem("vibe_workspace", workspace), [workspace]);
@@ -350,6 +402,36 @@ export default function App() {
     return invoke<string>("window_screenshot");
   }
 
+  function agentBrowserTarget(tabId?: string): string {
+    const targetId = tabId || activeBrowserIdRef.current;
+    if (!targetId || !browserTabsRef.current.some((tab) => tab.id === targetId)) throw new Error("browser tab not found");
+    return targetId;
+  }
+
+  async function agentBrowserDom(tabId?: string) {
+    return invoke("browser_dom_snapshot", { tabId: agentBrowserTarget(tabId) });
+  }
+
+  async function agentBrowserClick(selector: string, tabId?: string) {
+    return invoke("browser_click", { tabId: agentBrowserTarget(tabId), selector });
+  }
+
+  async function agentBrowserType(selector: string, text: string, clear = false, tabId?: string) {
+    return invoke("browser_type", { tabId: agentBrowserTarget(tabId), selector, text, clear });
+  }
+
+  async function agentBrowserSubmit(selector: string, tabId?: string) {
+    return invoke("browser_submit", { tabId: agentBrowserTarget(tabId), selector });
+  }
+
+  async function agentBrowserScroll(x: number, y: number, selector?: string, tabId?: string) {
+    return invoke("browser_scroll", { tabId: agentBrowserTarget(tabId), selector, x, y });
+  }
+
+  async function agentBrowserKey(key: string, selector?: string, tabId?: string) {
+    return invoke("browser_key", { tabId: agentBrowserTarget(tabId), selector, key });
+  }
+
   function changeTab(path: string, content: string) {
     setTabs((cur) => cur.map((t) => (t.path === path ? { ...t, content } : t)));
   }
@@ -479,7 +561,15 @@ export default function App() {
         navigate: agentBrowserNavigate,
         close: agentBrowserClose,
         screenshot: agentBrowserScreenshot,
+        dom: agentBrowserDom,
+        click: agentBrowserClick,
+        type: agentBrowserType,
+        submit: agentBrowserSubmit,
+        scroll: agentBrowserScroll,
+        key: agentBrowserKey,
       }}
+      lowPowerMode={lowPowerMode}
+      onLowPowerModeChange={setLowPowerMode}
     />
   );
 
@@ -510,7 +600,7 @@ export default function App() {
           onChange={(e) => setActiveProviderId(e.target.value)}
           title={t("apiService")}
         >
-          {providers.map((p) => (
+          {providers.filter((p) => p.apiKey || p.id === activeProviderId).map((p) => (
             <option key={p.id} value={p.id}>
               {p.name}
               {p.apiKey ? "" : ` (${t("noKey")})`}
@@ -657,6 +747,7 @@ export default function App() {
                     onNewBrowserTab={newBrowserTab}
                     onTranscribe={transcribeFile}
                     fileVersions={fileVersions}
+                    lowPowerMode={lowPowerMode}
                   />
                 </Panel>
                 {bottomVisible && <PanelResizeHandle key="term-h" className="resize-v" />}
@@ -731,6 +822,10 @@ export default function App() {
           }}
           mcpServers={mcpServers}
           onSaveMcp={setMcpServers}
+          onOpenLocalModels={() => {
+            setShowProviders(false);
+            setShowModels(true);
+          }}
         />
       )}
 

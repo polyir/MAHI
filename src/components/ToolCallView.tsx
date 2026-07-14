@@ -29,17 +29,26 @@ const TOOL_ICONS: Record<string, React.ReactNode> = {
   edit_file: <FilePen size={13} />,
   delete_file: <FileX size={13} />,
   move_file: <MoveRight size={13} />,
+  copy_library_asset: <FilePlus size={13} />,
   list_dir: <FolderTree size={13} />,
   glob_files: <Search size={13} />,
   search_files: <Search size={13} />,
   run_command: <TerminalSquare size={13} />,
   generate_image: <Image size={13} />,
   generate_audio: <Music size={13} />,
+  generate_music: <Music size={13} />,
+  generate_sound_effect: <Volume2 size={13} />,
   generate_video: <Video size={13} />,
   browser_open: <Globe size={13} />,
   browser_navigate: <Globe size={13} />,
   browser_close: <Globe size={13} />,
   browser_screenshot: <Camera size={13} />,
+  browser_dom: <Globe size={13} />,
+  browser_click: <Globe size={13} />,
+  browser_type: <Globe size={13} />,
+  browser_submit: <Globe size={13} />,
+  browser_scroll: <Globe size={13} />,
+  browser_key: <Globe size={13} />,
   open_file_in_editor: <FileText size={13} />,
   view_screen: <Camera size={13} />,
   transcribe_media: <Captions size={13} />,
@@ -55,6 +64,8 @@ function summarize(name: string, args: any): string {
       return `${name} ${args?.path ?? ""}`;
     case "move_file":
       return `move ${args?.from ?? ""} → ${args?.to ?? ""}`;
+    case "copy_library_asset":
+      return `library asset → ${args?.path ?? ""}`;
     case "list_dir":
       return `list_dir ${args?.path || "."}`;
     case "glob_files":
@@ -65,6 +76,8 @@ function summarize(name: string, args: any): string {
       return `$ ${args?.cmd ?? ""}`;
     case "generate_image":
     case "generate_audio":
+    case "generate_music":
+    case "generate_sound_effect":
     case "generate_video":
       return `${name} ${args?.path ?? ""}`;
     case "browser_open":
@@ -75,6 +88,17 @@ function summarize(name: string, args: any): string {
       return `browser_close ${args?.tab_id ?? "(active tab)"}`;
     case "browser_screenshot":
       return "browser_screenshot";
+    case "browser_dom":
+      return `browser_dom ${args?.tab_id ?? "(active tab)"}`;
+    case "browser_click":
+    case "browser_submit":
+      return `${name} ${args?.selector ?? ""}`;
+    case "browser_type":
+      return `browser_type ${args?.selector ?? ""}`;
+    case "browser_scroll":
+      return `browser_scroll ${args?.y ?? 0}px`;
+    case "browser_key":
+      return `browser_key ${args?.key ?? ""}`;
     case "open_file_in_editor":
       return `open_file_in_editor ${args?.path ?? ""}`;
     case "view_screen":
@@ -154,7 +178,7 @@ export default function ToolCallView({
             </pre>
           )}
           {name === "generate_image" && !isError && <ImagePreview workspace={workspace} path={args.path} />}
-          {(name === "generate_audio" || name === "speak_text") && !isError && (
+          {(["generate_audio", "generate_music", "generate_sound_effect", "speak_text"].includes(name)) && !isError && (
             <MediaPreview workspace={workspace} path={args.path} kind="audio" />
           )}
           {name === "transcribe_media" && !isError && (
@@ -187,6 +211,12 @@ export default function ToolCallView({
             "browser_open",
             "browser_navigate",
             "browser_close",
+            "browser_dom",
+            "browser_click",
+            "browser_type",
+            "browser_submit",
+            "browser_scroll",
+            "browser_key",
             "open_file_in_editor",
           ].includes(name) ||
             (name === "run_command" && !parsedRunResult) ||

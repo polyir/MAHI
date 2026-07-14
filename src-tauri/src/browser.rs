@@ -14,9 +14,11 @@
 use base64::Engine;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewBuilder, WebviewUrl};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewBuilder, WebviewUrl,
+};
 
 fn label_for(tab_id: &str) -> String {
     format!("agent-browser-{tab_id}")
@@ -60,10 +62,21 @@ pub fn browser_open(
 }
 
 #[tauri::command]
-pub fn browser_reposition(app: AppHandle, tab_id: String, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
-    let wv = app.get_webview(&label_for(&tab_id)).ok_or("browser not open")?;
-    wv.set_position(PhysicalPosition::new(x, y)).map_err(|e| e.to_string())?;
-    wv.set_size(PhysicalSize::new(width, height)).map_err(|e| e.to_string())?;
+pub fn browser_reposition(
+    app: AppHandle,
+    tab_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let wv = app
+        .get_webview(&label_for(&tab_id))
+        .ok_or("browser not open")?;
+    wv.set_position(PhysicalPosition::new(x, y))
+        .map_err(|e| e.to_string())?;
+    wv.set_size(PhysicalSize::new(width, height))
+        .map_err(|e| e.to_string())?;
     // reportRect() (frontend) calls this whenever a tab becomes active again
     // after being hidden — show() here is what actually brings it back.
     wv.show().map_err(|e| e.to_string())?;
@@ -73,7 +86,9 @@ pub fn browser_reposition(app: AppHandle, tab_id: String, x: f64, y: f64, width:
 #[tauri::command]
 pub fn browser_navigate(app: AppHandle, tab_id: String, url: String) -> Result<(), String> {
     let parsed = parse_url(&url)?;
-    let wv = app.get_webview(&label_for(&tab_id)).ok_or("browser not open")?;
+    let wv = app
+        .get_webview(&label_for(&tab_id))
+        .ok_or("browser not open")?;
     wv.navigate(parsed).map_err(|e| e.to_string())
 }
 
@@ -86,12 +101,187 @@ pub fn browser_hide(app: AppHandle, tab_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn browser_close(app: AppHandle, state: tauri::State<PickerManager>, tab_id: String) -> Result<(), String> {
+pub fn browser_close(
+    app: AppHandle,
+    state: tauri::State<PickerManager>,
+    tab_id: String,
+) -> Result<(), String> {
     stop_picker_task(&state, &tab_id);
     if let Some(wv) = app.get_webview(&label_for(&tab_id)) {
         wv.close().map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+async fn eval_json(
+    app: &AppHandle,
+    tab_id: &str,
+    script: String,
+) -> Result<serde_json::Value, String> {
+    let wv = app
+        .get_webview(&label_for(tab_id))
+        .ok_or("browser not open")?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    wv.eval_with_callback(&script, move |result| {
+        if let Some(tx) = tx.lock().unwrap().take() {
+            let _ = tx.send(result);
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    let raw = tokio::time::timeout(Duration::from_secs(8), rx)
+        .await
+        .map_err(|_| "browser script timed out".to_string())?
+        .map_err(|_| "browser script callback closed".to_string())?;
+    serde_json::from_str(&raw).map_err(|e| format!("invalid browser script result: {e}"))
+}
+
+#[tauri::command]
+pub async fn browser_dom_snapshot(
+    app: AppHandle,
+    tab_id: String,
+) -> Result<serde_json::Value, String> {
+    let script = r##"(function(){
+      function path(el){
+        if (!el || el.nodeType !== 1) return "";
+        if (el.id) return el.tagName.toLowerCase() + "#" + CSS.escape(el.id);
+        const out=[]; let cur=el;
+        while(cur && cur.nodeType===1 && out.length<6){
+          let p=cur.tagName.toLowerCase();
+          const parent=cur.parentElement;
+          if(parent){ const same=[...parent.children].filter(x=>x.tagName===cur.tagName); if(same.length>1)p+=`:nth-of-type(${same.indexOf(cur)+1})`; }
+          out.unshift(p); cur=parent;
+        }
+        return out.join(" > ");
+      }
+      const visible=el=>{ const r=el.getBoundingClientRect(),s=getComputedStyle(el); return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"; };
+      const nodes=[...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[contenteditable="true"],[tabindex]')]
+        .filter(visible).slice(0,250).map(el=>{
+          const type=el.getAttribute('type')||'';
+          return { tag:el.tagName.toLowerCase(), selector:path(el),
+            text:String(el.innerText||el.getAttribute('aria-label')||el.getAttribute('placeholder')||'').trim().slice(0,180),
+            type, role:el.getAttribute('role')||'', disabled:!!el.disabled,
+            checked:typeof el.checked==='boolean'?el.checked:undefined };
+        });
+      return { url:location.href, title:document.title, text:String(document.body?.innerText||'').trim().slice(0,12000), elements:nodes };
+    })()"##.to_string();
+    eval_json(&app, &tab_id, script).await
+}
+
+fn js_arg(value: &str) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn browser_click(
+    app: AppHandle,
+    tab_id: String,
+    selector: String,
+) -> Result<serde_json::Value, String> {
+    let selector = js_arg(&selector)?;
+    let script = format!(
+        r##"(function(){{
+      const el=document.querySelector({selector}); if(!el)return {{ok:false,error:'element not found'}};
+      const target=el.closest('button,input,a,[role="button"]')||el;
+      const label=String(target.innerText||target.value||target.getAttribute('aria-label')||'').trim();
+      const type=String(target.getAttribute('type')||'').toLowerCase();
+      if(type==='submit'||type==='image'||(target.tagName==='BUTTON'&&target.closest('form')&&type!=='button')||/\b(delete|remove|purchase|buy|checkout|pay|send|post|confirm|sign in|log in|create account)\b/i.test(label))
+        return {{ok:false,blocked:true,error:'sensitive action requires browser_submit',label}};
+      target.scrollIntoView({{block:'center',inline:'center'}}); target.focus(); const r=target.getBoundingClientRect(); target.click();
+      const dot=document.createElement('div'); Object.assign(dot.style,{{position:'fixed',zIndex:'2147483647',width:'18px',height:'18px',border:'2px solid #00ebd4',borderRadius:'50%',pointerEvents:'none',left:(r.left+r.width/2-9)+'px',top:(r.top+r.height/2-9)+'px',boxShadow:'0 0 14px #00ebd4'}}); document.documentElement.appendChild(dot); setTimeout(()=>dot.remove(),700);
+      return {{ok:true,label,url:location.href}};
+    }})()"##
+    );
+    eval_json(&app, &tab_id, script).await
+}
+
+#[tauri::command]
+pub async fn browser_type(
+    app: AppHandle,
+    tab_id: String,
+    selector: String,
+    text: String,
+    clear: bool,
+) -> Result<serde_json::Value, String> {
+    let selector = js_arg(&selector)?;
+    let text = js_arg(&text)?;
+    let script = format!(
+        r##"(function(){{
+      const el=document.querySelector({selector}); if(!el)return {{ok:false,error:'element not found'}};
+      const type=String(el.getAttribute('type')||'').toLowerCase(), ac=String(el.getAttribute('autocomplete')||'').toLowerCase();
+      if(type==='password'||type==='hidden'||type==='file'||ac.startsWith('cc-'))return {{ok:false,blocked:true,error:'sensitive field is not available to automatic typing'}};
+      el.scrollIntoView({{block:'center'}}); el.focus();
+      const next={clear}?{text}:String(el.value||'')+{text};
+      if('value' in el){{ const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value')?.set; setter?setter.call(el,next):(el.value=next); }} else el.textContent=next;
+      el.dispatchEvent(new InputEvent('input',{{bubbles:true,inputType:'insertText',data:{text}}})); el.dispatchEvent(new Event('change',{{bubbles:true}}));
+      el.style.outline='2px solid #00ebd4'; setTimeout(()=>{{el.style.outline='';}},700);
+      return {{ok:true,valueLength:next.length}};
+    }})()"##
+    );
+    eval_json(&app, &tab_id, script).await
+}
+
+#[tauri::command]
+pub async fn browser_submit(
+    app: AppHandle,
+    tab_id: String,
+    selector: String,
+) -> Result<serde_json::Value, String> {
+    let selector = js_arg(&selector)?;
+    let script = format!(
+        r##"(function(){{
+      const el=document.querySelector({selector}); if(!el)return {{ok:false,error:'element not found'}};
+      el.scrollIntoView({{block:'center'}}); el.focus();
+      const form=el.closest('form'); if(form) form.requestSubmit(); else el.click();
+      return {{ok:true,url:location.href}};
+    }})()"##
+    );
+    eval_json(&app, &tab_id, script).await
+}
+
+#[tauri::command]
+pub async fn browser_scroll(
+    app: AppHandle,
+    tab_id: String,
+    selector: Option<String>,
+    x: f64,
+    y: f64,
+) -> Result<serde_json::Value, String> {
+    let selector = js_arg(selector.as_deref().unwrap_or(""))?;
+    let script = format!(
+        r##"(function(){{ const el={selector}?document.querySelector({selector}):window; if(!el)return {{ok:false,error:'element not found'}}; el.scrollBy({{left:{x},top:{y},behavior:'smooth'}}); return {{ok:true,scrollX:window.scrollX,scrollY:window.scrollY}}; }})()"##
+    );
+    eval_json(&app, &tab_id, script).await
+}
+
+#[tauri::command]
+pub async fn browser_key(
+    app: AppHandle,
+    tab_id: String,
+    selector: Option<String>,
+    key: String,
+) -> Result<serde_json::Value, String> {
+    const ALLOWED: &[&str] = &[
+        "Tab",
+        "Escape",
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "PageUp",
+        "PageDown",
+        "Home",
+        "End",
+    ];
+    if !ALLOWED.contains(&key.as_str()) {
+        return Err("key not allowed; use browser_submit for Enter/submission".into());
+    }
+    let selector = js_arg(selector.as_deref().unwrap_or(""))?;
+    let key = js_arg(&key)?;
+    let script = format!(
+        r##"(function(){{ let el={selector}?document.querySelector({selector}):document.activeElement; if(!el)return {{ok:false,error:'element not found'}}; el.focus(); if({key}==='Tab'){{ const items=[...document.querySelectorAll('a,button,input,textarea,select,[tabindex],[contenteditable="true"]')].filter(x=>!x.disabled&&x.tabIndex>=0&&x.getBoundingClientRect().width>0); const i=items.indexOf(el); el=items[(i+1+items.length)%items.length]||el; el.focus(); }} else for(const type of ['keydown','keyup'])el.dispatchEvent(new KeyboardEvent(type,{{key:{key},bubbles:true}})); return {{ok:true,key:{key}}}; }})()"##
+    );
+    eval_json(&app, &tab_id, script).await
 }
 
 // "Inspect element" mode: hover-highlights whatever's under the cursor and,
@@ -217,8 +407,14 @@ const PICKER_POLL_SCRIPT: &str =
     "(function(){ const p = window.__mahiPending; window.__mahiPending = null; return p; })()";
 
 #[tauri::command]
-pub fn browser_start_picker(app: AppHandle, state: tauri::State<PickerManager>, tab_id: String) -> Result<(), String> {
-    let wv = app.get_webview(&label_for(&tab_id)).ok_or("browser not open")?;
+pub fn browser_start_picker(
+    app: AppHandle,
+    state: tauri::State<PickerManager>,
+    tab_id: String,
+) -> Result<(), String> {
+    let wv = app
+        .get_webview(&label_for(&tab_id))
+        .ok_or("browser not open")?;
     wv.eval(PICKER_INJECT_SCRIPT).map_err(|e| e.to_string())?;
 
     stop_picker_task(&state, &tab_id);
@@ -261,7 +457,11 @@ pub fn browser_start_picker(app: AppHandle, state: tauri::State<PickerManager>, 
 }
 
 #[tauri::command]
-pub fn browser_stop_picker(app: AppHandle, state: tauri::State<PickerManager>, tab_id: String) -> Result<(), String> {
+pub fn browser_stop_picker(
+    app: AppHandle,
+    state: tauri::State<PickerManager>,
+    tab_id: String,
+) -> Result<(), String> {
     stop_picker_task(&state, &tab_id);
     if let Some(wv) = app.get_webview(&label_for(&tab_id)) {
         let _ = wv.eval(PICKER_STOP_SCRIPT);
@@ -289,7 +489,9 @@ pub fn browser_capture_element_screenshot(
     rect_w: f64,
     rect_h: f64,
 ) -> Result<String, String> {
-    let wv = app.get_webview(&label_for(&tab_id)).ok_or("browser not open")?;
+    let wv = app
+        .get_webview(&label_for(&tab_id))
+        .ok_or("browser not open")?;
     let wv_pos = wv.position().map_err(|e| e.to_string())?;
     let main = app.get_window("main").ok_or("no main window")?;
     let inner = main.inner_position().map_err(|e| e.to_string())?;

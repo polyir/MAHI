@@ -13,6 +13,16 @@ function toBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
+async function saveAudioResponse(resp: Response, workspace: string, outPath: string): Promise<void> {
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => "");
+    throw new Error(`ElevenLabs error ${resp.status}${detail ? `: ${detail.slice(0, 500)}` : ""}`);
+  }
+  const buf = await resp.arrayBuffer();
+  if (!buf.byteLength) throw new Error("ElevenLabs returned an empty audio file");
+  await invoke("write_file_binary", { workspace, path: outPath, base64Content: toBase64(buf) });
+}
+
 export type ElevenLabsModel = { model_id: string; name: string };
 
 /// Lists the TTS-capable models available to this API key (e.g.
@@ -70,6 +80,58 @@ export async function synthesizeElevenLabs(workspace: string, text: string, outP
   const buf = await resp.arrayBuffer();
   await invoke("write_file_binary", { workspace, path: outPath, base64Content: toBase64(buf) });
   return new Blob([buf], { type: "audio/mpeg" });
+}
+
+export async function generateElevenLabsMusic(workspace: string, args: {
+  prompt: string; path: string; duration_seconds?: number; model_id?: string; instrumental?: boolean;
+}, signal?: AbortSignal): Promise<void> {
+  const apiKey = loadElevenLabsApiKey();
+  if (!apiKey) throw new Error("ElevenLabs API key not configured — open Settings → Local AI Models");
+  const prompt = String(args.prompt ?? "").trim();
+  if (!prompt || prompt.length > 4100) throw new Error("Music prompt must contain 1–4100 characters");
+  const duration = args.duration_seconds == null ? 30 : Number(args.duration_seconds);
+  if (!Number.isFinite(duration) || duration < 3 || duration > 600) throw new Error("Music duration must be between 3 and 600 seconds");
+  const modelId = args.model_id === "music_v1" ? "music_v1" : "music_v2";
+  const resp = await tauriFetch("https://api.elevenlabs.io/v1/music?output_format=auto", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "xi-api-key": apiKey },
+    body: JSON.stringify({
+      prompt,
+      music_length_ms: Math.round(duration * 1000),
+      model_id: modelId,
+      force_instrumental: !!args.instrumental,
+    }),
+    signal,
+  });
+  await saveAudioResponse(resp, workspace, args.path);
+}
+
+export async function generateElevenLabsSoundEffect(workspace: string, args: {
+  text: string; path: string; duration_seconds?: number; prompt_influence?: number; loop?: boolean;
+}, signal?: AbortSignal): Promise<void> {
+  const apiKey = loadElevenLabsApiKey();
+  if (!apiKey) throw new Error("ElevenLabs API key not configured — open Settings → Local AI Models");
+  const text = String(args.text ?? "").trim();
+  if (!text) throw new Error("Sound-effect description is required");
+  const duration = args.duration_seconds == null ? undefined : Number(args.duration_seconds);
+  if (duration != null && (!Number.isFinite(duration) || duration < 0.5 || duration > 30)) {
+    throw new Error("Sound-effect duration must be between 0.5 and 30 seconds");
+  }
+  const influence = args.prompt_influence == null ? 0.3 : Number(args.prompt_influence);
+  if (!Number.isFinite(influence) || influence < 0 || influence > 1) throw new Error("Prompt influence must be between 0 and 1");
+  const resp = await tauriFetch("https://api.elevenlabs.io/v1/sound-generation?output_format=mp3_44100_128", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "xi-api-key": apiKey },
+    body: JSON.stringify({
+      text,
+      model_id: "eleven_text_to_sound_v2",
+      duration_seconds: duration,
+      prompt_influence: influence,
+      loop: !!args.loop,
+    }),
+    signal,
+  });
+  await saveAudioResponse(resp, workspace, args.path);
 }
 
 // ElevenLabs's only speech-to-text model as of this writing — unlike the

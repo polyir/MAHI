@@ -25,25 +25,6 @@ ${FINAL_PROMPT_END}`;
 
 export const PROMPT_TEMPLATES: PromptTemplate[] = [
   {
-    id: "workflow",
-    systemPrompt: `You are helping the user prepare a single ready-to-send prompt that will make a coding agent scaffold a complete "workflow" directory: an input folder, an output folder, written processing instructions, and "lock" files that pin down constraints the workflow must never violate.
-
-Before producing the final prompt, check whether the conversation already establishes:
-1. A short workflow name (kebab-case, used as the root folder name).
-2. What kind of input the workflow consumes (format, source).
-3. What kind of output it produces (format, destination).
-4. The concrete processing steps/logic between input and output.
-5. Style constraints (tone, language, formatting rules) to pin in style-lock.md.
-6. Response-format constraints (structure, required fields, length limits) to pin in response-lock.md.
-${PROTOCOL}
-The final prompt must tell the agent to create exactly:
-- <workflow-name>/input/ (with a short note on what belongs there)
-- <workflow-name>/output/ (with a short note on what belongs there)
-- <workflow-name>/instructions.md (the full step-by-step processing logic)
-- <workflow-name>/style-lock.md (the style constraints, phrased as hard rules)
-- <workflow-name>/response-lock.md (the response-format constraints, phrased as hard rules)`,
-  },
-  {
     id: "skill",
     systemPrompt: `You are helping the user prepare a single ready-to-send prompt that will make a coding agent scaffold a complete "skill" — a self-contained, reusable agent capability definition (similar to a Claude Code skill).
 

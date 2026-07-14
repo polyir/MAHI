@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 
 // 60 pre-scaled frames of the MAHI medallion animation, bundled by Vite.
 const frameModules = import.meta.glob("../assets/fish-frames/*.png", {
@@ -12,21 +12,38 @@ const FRAMES = Object.keys(frameModules)
   .map((k) => frameModules[k]);
 
 export default function FishLoader({ size = 72 }: { size?: number }) {
-  const [i, setI] = useState(0);
+  const imgRef = useRef<HTMLImageElement>(null);
   const raf = useRef<number>(0);
   const last = useRef(0);
+  const frame = useRef(0);
 
   useEffect(() => {
     const FPS = 14;
     function tick(t: number) {
       if (t - last.current >= 1000 / FPS) {
         last.current = t;
-        setI((cur) => (cur + 1) % FRAMES.length);
+        frame.current = (frame.current + 1) % FRAMES.length;
+        if (imgRef.current) imgRef.current.src = FRAMES[frame.current];
       }
       raf.current = requestAnimationFrame(tick);
     }
-    raf.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf.current);
+
+    function syncAnimation() {
+      cancelAnimationFrame(raf.current);
+      raf.current = 0;
+      if (!document.hidden && !document.documentElement.classList.contains("low-power")) {
+        raf.current = requestAnimationFrame(tick);
+      }
+    }
+
+    document.addEventListener("visibilitychange", syncAnimation);
+    window.addEventListener("mahi-low-power-change", syncAnimation);
+    syncAnimation();
+    return () => {
+      cancelAnimationFrame(raf.current);
+      document.removeEventListener("visibilitychange", syncAnimation);
+      window.removeEventListener("mahi-low-power-change", syncAnimation);
+    };
   }, []);
 
   if (FRAMES.length === 0) return null;
@@ -43,7 +60,8 @@ export default function FishLoader({ size = 72 }: { size?: number }) {
       }}
     >
       <img
-        src={FRAMES[i]}
+        ref={imgRef}
+        src={FRAMES[0]}
         alt=""
         style={{
           width: "100%",

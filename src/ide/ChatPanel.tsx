@@ -23,13 +23,17 @@ import {
   Network,
   SlidersHorizontal,
   Puzzle,
+  Library,
 } from "lucide-react";
 import {
   agentTurn,
   makeClient,
+  providerComplete,
   Msg,
   Usage,
-  sanitizeEffort,
+  defaultReasoningEffort,
+  reasoningEffortOptions,
+  reasoningEffortChoices,
   sanitizeHistory,
   compactHistory,
   BrowserControl,
@@ -54,7 +58,7 @@ import type { Project } from "./projects";
 import { loadProjects, saveProjects, loadActiveProjectId, saveActiveProjectId, newProject } from "./projects";
 import type { Provider } from "./providers";
 import { LOCAL_PROVIDER_ID } from "./providers";
-import type { McpServer } from "./mcp";
+import { listMcpTools, type McpServer } from "./mcp";
 import {
   loadLocalCtxOverride,
   localPromptBudget,
@@ -74,8 +78,16 @@ import {
   summarizeHistory,
 } from "./localLlm";
 import { t, useLang, dir as uiDir, getLang } from "./i18n";
+import LibraryModal from "./LibraryModal";
+import { activeLibraryItems, enabledLibraryCount, LibraryItem, libraryDisplayName, libraryPrompt, listLibrary, loadLibraryImages } from "./library";
 
 const MAX_ATTACH_CHARS = 8000;
+const KEEP_SKILLS_KEY = "mahi_keep_selected_skills_";
+
+function loadKeepSelectedSkills(projectId: string): boolean {
+  return projectId ? localStorage.getItem(`${KEEP_SKILLS_KEY}${projectId}`) === "1" : false;
+}
+
 const TURN_MUTATION_TOOLS = new Set([
   "write_file",
   "edit_file",
@@ -83,6 +95,8 @@ const TURN_MUTATION_TOOLS = new Set([
   "move_file",
   "generate_image",
   "generate_audio",
+  "generate_music",
+  "generate_sound_effect",
   "speak_text",
 ]);
 const TREE_MUTATION_TOOLS = new Set([
@@ -91,6 +105,8 @@ const TREE_MUTATION_TOOLS = new Set([
   "move_file",
   "generate_image",
   "generate_audio",
+  "generate_music",
+  "generate_sound_effect",
   "speak_text",
 ]);
 
@@ -110,6 +126,8 @@ export default function ChatPanel({
   activeTabPath,
   onOpenFileForAgent,
   onOpenModels,
+  lowPowerMode,
+  onLowPowerModeChange,
 }: {
   provider: Provider;
   providers: Provider[];
@@ -131,11 +149,29 @@ export default function ChatPanel({
   // Opens Settings → Local AI Models — used when the user picks the local
   // provider/model but hasn't downloaded it yet.
   onOpenModels: () => void;
+  lowPowerMode: boolean;
+  onLowPowerModeChange: (enabled: boolean) => void;
 }) {
   useLang();
   const [projects, setProjects] = useState<Project[]>(loadProjects);
   const [activeProjectId, setActiveProjectId] = useState<string>(loadActiveProjectId);
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? projects[0];
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [skills, setSkills] = useState<LibraryItem[]>([]);
+  const activeSkillItems = activeProject ? activeLibraryItems(skills, activeProject.id) : [];
+  const [selectedSkillIds, setSelectedSkillIds] = useState<Set<string>>(new Set());
+  const [keepSelectedSkills, setKeepSelectedSkills] = useState(() => loadKeepSelectedSkills(loadActiveProjectId()));
+  const [showSkillPicker, setShowSkillPicker] = useState(false);
+  const selectedSkillItems = activeSkillItems.filter((skill) => selectedSkillIds.has(skill.id));
+
+  useEffect(() => {
+    listLibrary().then(setSkills).catch(() => setSkills([]));
+  }, []);
+  useEffect(() => {
+    setSelectedSkillIds(new Set());
+    setKeepSelectedSkills(loadKeepSelectedSkills(activeProject?.id ?? activeProjectId));
+    setShowSkillPicker(false);
+  }, [activeProjectId, activeProject?.id]);
   // The directory this chat's tool calls operate on — independent of
   // `workspace` (the IDE's own open-folder), which is only used below to
   // decide whether an agent file-change should also refresh the IDE tree.
@@ -173,6 +209,9 @@ export default function ChatPanel({
   // point for "what extra capabilities does this message have" rather than
   // one icon per capability.
   const [showCapabilities, setShowCapabilities] = useState(false);
+  const [mcpHealth, setMcpHealth] = useState<
+    Record<string, { state: "checking" | "connected" | "error"; toolCount?: number; error?: string }>
+  >({});
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [pickedElement, setPickedElement] = useState<{ tag: string; text: string; selector: string } | null>(null);
@@ -194,6 +233,35 @@ export default function ChatPanel({
   const [allowModelRouting, setAllowModelRouting] = useState(false);
   const [showRoutingConfirm, setShowRoutingConfirm] = useState(false);
   const [routingConfirmKeep, setRoutingConfirmKeep] = useState(false);
+  useEffect(() => {
+    if (!showCapabilities) return;
+    let active = true;
+    const enabled = mcpServers.filter((server) => server.enabled);
+    setMcpHealth(
+      Object.fromEntries(enabled.map((server) => [server.id, { state: "checking" as const }]))
+    );
+    void Promise.all(
+      enabled.map(async (server) => {
+        try {
+          const tools = await listMcpTools(server);
+          if (!active) return;
+          setMcpHealth((current) => ({
+            ...current,
+            [server.id]: { state: "connected", toolCount: tools.length },
+          }));
+        } catch (error) {
+          if (!active) return;
+          setMcpHealth((current) => ({
+            ...current,
+            [server.id]: { state: "error", error: String(error) },
+          }));
+        }
+      })
+    );
+    return () => {
+      active = false;
+    };
+  }, [showCapabilities, mcpServers]);
   // Sending while the switch is on but the project isn't yet trusted asks
   // once via the popup; this ref remembers "already confirmed this
   // session" without the stale-closure risk a state variable would have
@@ -203,27 +271,21 @@ export default function ChatPanel({
   const [recording, setRecording] = useState(false);
   const [micConnecting, setMicConnecting] = useState(false);
   const [transcribingMic, setTranscribingMic] = useState(false);
-  // The live MediaStream while recording, for VoiceWaveform — state (not
-  // just a ref) since mounting/unmounting the waveform needs a re-render.
-  const [micStream, setMicStream] = useState<MediaStream | null>(null);
-  // Hover-prewarm: getUserMedia's own device negotiation is what actually
-  // eats the first seconds of a recording (confirmed by the waveform now
-  // staying flat during that gap) — starting it a little earlier, on
-  // hover rather than on the click itself, gives it a head start. Only
-  // attempted when the OS has already granted mic access before (checked
-  // via the Permissions API), specifically so this never triggers a
-  // surprise permission prompt just from hovering the button.
-  const prewarmedStreamRef = useRef<MediaStream | null>(null);
+  const micRecordingPathRef = useRef<string | null>(null);
   useEffect(() => {
     return () => {
-      prewarmedStreamRef.current?.getTracks().forEach((tr) => tr.stop());
+      const path = micRecordingPathRef.current;
+      if (path) {
+        micRecordingPathRef.current = null;
+        invoke("microphone_stop")
+          .catch(() => {})
+          .finally(() => invoke("delete_file", { workspace: projectDir, path }).catch(() => {}));
+      }
     };
-  }, []);
+  }, [projectDir]);
   const [improving, setImproving] = useState(false);
   const [preparingAttachment, setPreparingAttachment] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>([]);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
   const [mentionOpen, setMentionOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const [projectFiles, setProjectFiles] = useState<string[]>([]);
@@ -389,6 +451,17 @@ export default function ChatPanel({
   const gaugeBudget =
     provider.id === LOCAL_PROVIDER_ID ? localPromptBudget(model) : active.contextBudget || 200_000;
 
+  // Reasoning effort's valid values depend on the selected provider+model
+  // (see reasoningEffortOptions in agent.ts) — a value picked for a
+  // different model is simply not in this list, so fall back to that
+  // model's own default instead of sending something invalid.
+  const effortOptions = reasoningEffortOptions(provider, model);
+  const effortChoices = reasoningEffortChoices(provider, model);
+  const effortValue =
+    active.reasoningEffort && effortOptions.includes(active.reasoningEffort)
+      ? active.reasoningEffort
+      : defaultReasoningEffort(provider, model);
+
   function pickProjectFolder() {
     open({ directory: true, multiple: false }).then((dir) => {
       if (typeof dir !== "string") return;
@@ -487,18 +560,10 @@ export default function ChatPanel({
   // local path, so behavior is consistent regardless of which the user picks.
   async function improveWithCloudProvider(p: Provider, model: string, draft: string, lang: string): Promise<string | null> {
     try {
-      const client = makeClient(p.apiKey, p.baseURL);
-      const resp = await client.chat.completions.create({
-        model: model || p.models[0],
-        messages: [
-          { role: "system", content: improvePromptSystem(lang) },
-          { role: "user", content: draft.slice(0, 4000) },
-        ],
-        max_tokens: 700,
-        temperature: 0.2,
-      });
-      const text = resp.choices[0]?.message?.content;
-      return text?.trim() || null;
+      return await providerComplete(p, model || p.models[0], [
+        { role: "system", content: improvePromptSystem(lang) },
+        { role: "user", content: draft.slice(0, 4000) },
+      ], { maxTokens: 700, temperature: 0.2 });
     } catch {
       return null;
     }
@@ -510,18 +575,10 @@ export default function ChatPanel({
   async function cleanDictationWithCloudProvider(p: Provider, model: string, text: string, lang: string): Promise<string | null> {
     if (text.length > 2000) return null;
     try {
-      const client = makeClient(p.apiKey, p.baseURL);
-      const resp = await client.chat.completions.create({
-        model: model || p.models[0],
-        messages: [
-          { role: "system", content: dictationCleanupSystem(lang) },
-          { role: "user", content: text },
-        ],
-        max_tokens: Math.max(200, Math.round(text.length * 1.3)),
-        temperature: 0.2,
-      });
-      const reply = resp.choices[0]?.message?.content;
-      return reply?.trim() || null;
+      return await providerComplete(p, model || p.models[0], [
+        { role: "system", content: dictationCleanupSystem(lang) },
+        { role: "user", content: text },
+      ], { maxTokens: Math.max(200, Math.round(text.length * 1.3)), temperature: 0.2 });
     } catch {
       return null;
     }
@@ -592,10 +649,17 @@ export default function ChatPanel({
   }
 
   const mentionMatches = useMemo(() => {
-    if (!mentionQuery) return projectFiles.slice(0, 8);
     const q = mentionQuery.toLowerCase();
-    return projectFiles.filter((f) => f.toLowerCase().includes(q)).slice(0, 8);
-  }, [mentionQuery, projectFiles]);
+    const projectMatches = projectFiles.map((path) => ({ key: `project:${path}`, label: path, projectPath: path }));
+    const skillMatches = activeSkillItems.flatMap((skill) => {
+      const skillName = libraryDisplayName(skill);
+      return [
+        { key: `skill:${skill.id}`, label: `Skill: ${skillName}`, reference: `@skill:${skillName}`, skillId: skill.id },
+        ...skill.files.map((file) => ({ key: `skill:${skill.id}:${file.name}`, label: `${skillName}/${file.name}`, reference: `@skill:${skillName}/${file.name}`, skillId: skill.id })),
+      ];
+    });
+    return [...skillMatches, ...projectMatches].filter((item) => !q || item.label.toLowerCase().includes(q)).slice(0, 8);
+  }, [mentionQuery, projectFiles, activeSkillItems]);
 
   function onInputChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const v = e.target.value;
@@ -603,7 +667,7 @@ export default function ChatPanel({
     // open mention dropdown while typing @word
     const caret = e.target.selectionStart ?? v.length;
     const before = v.slice(0, caret);
-    const m = before.match(/@([\w./-]*)$/);
+    const m = before.match(/@([^\s@]*)$/);
     if (m) {
       setMentionOpen(true);
       setMentionQuery(m[1]);
@@ -612,10 +676,10 @@ export default function ChatPanel({
     }
   }
 
-  function pickMention(path: string) {
-    // remove the trailing @query from input and attach the file instead
-    setInput((cur) => cur.replace(/@([\w./-]*)$/, ""));
-    setAttachments((cur) => (cur.includes(path) ? cur : [...cur, path]));
+  function pickMention(item: { projectPath?: string; reference?: string; skillId?: string }) {
+    setInput((cur) => cur.replace(/@([^\s@]*)$/, item.reference ? `${item.reference} ` : ""));
+    if (item.projectPath) setAttachments((cur) => (cur.includes(item.projectPath!) ? cur : [...cur, item.projectPath!]));
+    if (item.skillId) setSelectedSkillIds((current) => new Set(current).add(item.skillId!));
     setMentionOpen(false);
     inputRef.current?.focus();
   }
@@ -731,89 +795,43 @@ export default function ChatPanel({
     }
   }
 
-  // Only ever pre-warms when the OS has already granted mic access, so
-  // hovering the button can never itself trigger a permission prompt —
-  // that stays tied to an explicit click, same as before. Silently does
-  // nothing if the Permissions API is unavailable/unsupported (some
-  // webviews don't implement the "microphone" query) or access isn't
-  // granted yet; startRecording() falls back to a fresh getUserMedia call
-  // either way, so there's no behavior regression if this never fires.
-  async function prewarmMic() {
-    if (prewarmedStreamRef.current || recording || micConnecting) return;
-    try {
-      const status = await navigator.permissions.query({ name: "microphone" as PermissionName });
-      if (status.state !== "granted") return;
-      prewarmedStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
-    } catch {
-      // Permissions API unsupported, or getUserMedia failed — fine, startRecording tries again.
-    }
-  }
-
-  function releasePrewarmedMic() {
-    prewarmedStreamRef.current?.getTracks().forEach((tr) => tr.stop());
-    prewarmedStreamRef.current = null;
-  }
-
-  // Voice input: record with MediaRecorder, hand the clip to the same
-  // transcribe_media/Whisper pipeline the "Transcribe" button uses (a real
-  // file on disk, not a new code path), then append the transcript to
-  // whatever's already typed rather than replacing it.
+  // Voice input is recorded natively because WKWebView's custom tauri://
+  // origin doesn't expose navigator.mediaDevices on macOS.
   async function startRecording() {
-    if (!loadActiveAsrModel()) {
+    if (!isElevenLabsAsrEnabled() && !loadActiveAsrModel()) {
       toast(t("noAsrModel"), "err");
       return;
     }
-    // Feedback the instant the button is pressed — getUserMedia (and the
-    // OS's own mic-activation indicator) can take a visible moment, and
-    // without this the button looked unresponsive for that whole gap. The
-    // waveform (see VoiceWaveform/micStream below) makes that gap visible
-    // too: bars stay flat until real audio is actually flowing, so it's
-    // obvious when to actually start talking instead of losing the first
-    // words to a mic that only looked ready.
     setMicConnecting(true);
+    const recPath = `.mahi-mic/${Date.now()}.m4a`;
     try {
-      const stream = prewarmedStreamRef.current ?? (await navigator.mediaDevices.getUserMedia({ audio: true }));
-      prewarmedStreamRef.current = null; // ownership moves here; don't double-stop it on hover-out
-      const mimeType = ["audio/mp4", "audio/webm", "audio/wav"].find((m) => MediaRecorder.isTypeSupported(m));
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      recordedChunksRef.current = [];
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
-      };
-      recorder.onstop = () => {
-        stream.getTracks().forEach((tr) => tr.stop());
-        setMicStream(null);
-        void finishRecording(recorder.mimeType || mimeType || "audio/webm");
-      };
-      mediaRecorderRef.current = recorder;
-      recorder.start();
+      await invoke("microphone_start", { workspace: projectDir, path: recPath });
+      micRecordingPathRef.current = recPath;
       setMicConnecting(false);
       setRecording(true);
-      setMicStream(stream);
     } catch (e) {
       setMicConnecting(false);
       toast(`${t("micError")}: ${String(e)}`, "err");
     }
   }
 
-  function stopRecording() {
-    mediaRecorderRef.current?.stop();
+  async function stopRecording() {
+    const recPath = micRecordingPathRef.current;
+    micRecordingPathRef.current = null;
     setRecording(false);
+    if (!recPath) return;
+    try {
+      await invoke("microphone_stop");
+      await finishRecording(recPath);
+    } catch (e) {
+      toast(`${t("micError")}: ${String(e)}`, "err");
+      invoke("delete_file", { workspace: projectDir, path: recPath }).catch(() => {});
+    }
   }
 
-  async function finishRecording(mimeType: string) {
-    const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-    recordedChunksRef.current = [];
-    if (blob.size === 0) return;
+  async function finishRecording(recPath: string) {
     setTranscribingMic(true);
-    const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("wav") ? "wav" : "m4a";
-    const recPath = `.mahi-mic/${Date.now()}.${ext}`;
     try {
-      const buf = new Uint8Array(await blob.arrayBuffer());
-      let binary = "";
-      for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
-      const base64Content = btoa(binary);
-      await invoke("write_file_binary", { workspace: projectDir, path: recPath, base64Content });
       // Opt-in (Settings → Local AI Models): routes dictation through
       // ElevenLabs's cloud speech-to-text instead of the local Whisper
       // model. Falls back to local Whisper on any failure (bad/missing API
@@ -822,6 +840,10 @@ export default function ChatPanel({
       const result = isElevenLabsAsrEnabled()
         ? await (async () => {
             try {
+              const base64Audio = await invoke<string>("microphone_read", { workspace: projectDir, path: recPath });
+              const binary = atob(base64Audio);
+              const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+              const blob = new Blob([bytes], { type: "audio/mp4" });
               const r = await transcribeElevenLabs(blob);
               return { text: r.text, detected_language: r.languageCode };
             } catch (e) {
@@ -872,7 +894,7 @@ export default function ChatPanel({
   }
 
   function toggleRecording() {
-    if (recording) stopRecording();
+    if (recording) void stopRecording();
     else void startRecording();
   }
 
@@ -880,10 +902,14 @@ export default function ChatPanel({
   // API call within a turn (these APIs are stateless), so keep it small and
   // reuse one fetch per workspace instead of re-fetching every send.
   const treeCache = useRef<{ workspace: string; maxEntries: number; tree: string } | null>(null);
-  async function buildSystemContent(): Promise<string> {
+  async function buildSystemContent(turnSkills: LibraryItem[] = []): Promise<string> {
     let systemContent = activeProject?.instructions
       ? `${activeProject.instructions}\n\n${active.systemPrompt}`
       : active.systemPrompt;
+    if (activeProject) {
+      systemContent += libraryPrompt(turnSkills);
+      if (turnSkills.length) systemContent += `\nProject skill map: ${projectDir}/.mahi/skills.yaml`;
+    }
     try {
       // Local models have far smaller context windows than the cloud
       // providers this tree size was tuned for — a large workspace's tree
@@ -927,6 +953,9 @@ export default function ChatPanel({
     // suggestion-chips call below; works for both send() and continueTurn()
     // without either needing to pass it explicitly.
     const lastUserMsg = [...history].reverse().find((m) => m.role === "user");
+    const turnSkillRoots = activeSkillItems
+      .filter((skill) => lastUserMsg?.skillIds?.includes(skill.id))
+      .map((skill) => skill.bundleRoot);
 
     // The local provider has no real baseURL until the sidecar for this
     // specific model is actually running — resolve it fresh each turn
@@ -962,10 +991,8 @@ export default function ChatPanel({
 
     try {
       await agentTurn(clientRef.current, model, projectDir, history, {
-        // reasoning_effort is Sakana-specific; other providers may reject
-        // unknown params, so only send it there.
-        reasoningEffort: provider.id === "sakana" ? sanitizeEffort(active.reasoningEffort) : undefined,
-        temperature: active.temperature,
+        reasoningEffort: effortValue,
+        temperature: active.temperatureEnabled ? active.temperature : undefined,
         signal: controller.signal,
         checkpointId,
         contextBudget: gaugeBudget,
@@ -999,6 +1026,7 @@ export default function ChatPanel({
         allProviders: providers,
         mcpServers,
         allowModelRouting,
+        skillRoots: turnSkillRoots,
         browserControl,
         onScreenshot,
         // Opening a tab only makes sense when this chat's project is the
@@ -1012,7 +1040,13 @@ export default function ChatPanel({
         addMessage({ role: "assistant", content: t("stoppedMsg") });
       } else {
         hadError = true;
-        addMessage({ role: "assistant", content: `${t("disconnectedPrefix")}: ${String(e?.message ?? e)}` });
+        // Extract useful provider details for the visible error message without
+        // duplicating the full SDK error (which may contain request data) into
+        // the WebView console.
+        const errStatus = e?.status ?? e?.response?.status;
+        const errBody = e?.error ? JSON.stringify(e.error) : (e?.message ?? String(e));
+        const errDisplay = errStatus ? `${errStatus}: ${errBody}` : errBody;
+        addMessage({ role: "assistant", content: `${t("disconnectedPrefix")}: ${errDisplay}` });
         toast(t("disconnectToast"), "err");
       }
     } finally {
@@ -1126,6 +1160,8 @@ export default function ChatPanel({
     }
 
     const firstUserText = input;
+    const turnSkillIds = [...selectedSkillIds];
+    const turnSkills = activeSkillItems.filter((skill) => selectedSkillIds.has(skill.id));
     // Build user message: attachments are inlined as context blocks.
     let userContent = input;
     for (const path of attachments) {
@@ -1157,9 +1193,14 @@ export default function ChatPanel({
       content: userContent,
       checkpointId,
       images: pastedImages.length ? pastedImages : undefined,
+      skillIds: turnSkillIds.length ? turnSkillIds : undefined,
     };
     const isFirst = !active.messages.some((m) => m.role === "user");
-    const systemContent = await buildSystemContent();
+    const systemContent = await buildSystemContent(turnSkills);
+    const libraryImages = await loadLibraryImages(turnSkills).catch(() => []);
+    const wireUserMsg = libraryImages.length
+      ? { ...userMsg, images: [...(userMsg.images ?? []), ...libraryImages] }
+      : userMsg;
     // Older turns' tool dumps get compacted before sending — they'd otherwise
     // be re-billed on every internal call of this turn. outgoingHistory also
     // substitutes any local-model-generated summary for the messages it
@@ -1167,7 +1208,7 @@ export default function ChatPanel({
     const history: Msg[] = sanitizeHistory([
       { role: "system", content: systemContent },
       ...outgoingHistory(active),
-      userMsg,
+      wireUserMsg,
     ]);
 
     setSessions((cur) =>
@@ -1180,6 +1221,8 @@ export default function ChatPanel({
     setInput("");
     setAttachments([]);
     setPastedImages([]);
+    if (!keepSelectedSkills) setSelectedSkillIds(new Set());
+    setShowSkillPicker(false);
     await runTurn(history, checkpointId, { isFirstTurn: isFirst, firstUserText });
   }
 
@@ -1196,7 +1239,10 @@ export default function ChatPanel({
       checkpointId = undefined;
     }
 
-    const systemContent = await buildSystemContent();
+    const lastSkillIds = [...active.messages].reverse().find((message) => message.role === "user")?.skillIds ?? [];
+    const turnSkills = activeSkillItems.filter((skill) => lastSkillIds.includes(skill.id));
+    const systemContent = await buildSystemContent(turnSkills);
+    const libraryImages = await loadLibraryImages(turnSkills).catch(() => []);
     // Drop trailing local status notes (⏹/⚠️) so the model doesn't see them
     // as its own words; then repair dangling tool calls.
     const cleaned = active.messages.filter(
@@ -1211,11 +1257,13 @@ export default function ChatPanel({
       role: "user",
       content: "The previous work was interrupted (connection lost or stopped). Continue from where you left off and complete the task.",
       checkpointId,
+      skillIds: lastSkillIds.length ? lastSkillIds : undefined,
     };
+    const wireResumeMsg = libraryImages.length ? { ...resumeMsg, images: libraryImages } : resumeMsg;
     const history: Msg[] = sanitizeHistory([
       { role: "system", content: systemContent },
       ...outgoingHistory({ ...active, messages: cleaned }),
-      resumeMsg,
+      wireResumeMsg,
     ]);
 
     setSessions((cur) =>
@@ -1396,7 +1444,11 @@ export default function ChatPanel({
         )}
         {active.messages.map((m, i) => (
           <div key={i}>
-            <Message msg={m} workspace={projectDir} getScreenshot={getScreenshot} index={i} />
+            <Message
+              msg={m}
+              workspace={projectDir}
+              getScreenshot={getScreenshot}
+            />
             {m.role === "user" && m.checkpointId !== undefined && turnHasMutations.has(m.checkpointId) && (
               <div style={{ textAlign: "start", marginTop: 4 }}>
                 <button className="revert-btn" onClick={() => revertTo(m.checkpointId!)}>
@@ -1407,8 +1459,8 @@ export default function ChatPanel({
           </div>
         ))}
         {streamingText && (
-          <div className="typing">
-            <Message msg={{ role: "assistant", content: streamingText }} workspace={projectDir} index={active.messages.length} />
+          <div>
+            <Message msg={{ role: "assistant", content: streamingText }} workspace={projectDir} />
           </div>
         )}
         {(busy || improving || preparingAttachment) && !streamingText && (
@@ -1456,9 +1508,9 @@ export default function ChatPanel({
               boxShadow: "var(--shadow)",
             }}
           >
-            {mentionMatches.map((f) => (
-              <div key={f} className="tree-node" dir="ltr" onClick={() => pickMention(f)}>
-                {f}
+            {mentionMatches.map((item) => (
+              <div key={item.key} className="tree-node" dir="auto" onClick={() => pickMention(item)}>
+                {item.label}
               </div>
             ))}
           </div>
@@ -1571,6 +1623,42 @@ export default function ChatPanel({
           </div>
         )}
 
+        <div style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", marginBottom: 4 }}>
+          {effortOptions.length > 0 && (
+            <select
+              value={effortValue}
+              onChange={(e) => updateActive({ reasoningEffort: e.target.value })}
+              title={t("reasoningEffortTitle")}
+              style={{ fontSize: 10.5, padding: "0 2px", flexShrink: 0, height: 18 }}
+            >
+              {effortChoices.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          )}
+          <input
+            type="checkbox"
+            checked={active.temperatureEnabled}
+            onChange={(e) => updateActive({ temperatureEnabled: e.target.checked })}
+            title={t("temperature")}
+            style={{ flexShrink: 0 }}
+          />
+          <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{t("tempPrecise")}</span>
+          <input
+            className="temperature-slider"
+            type="range"
+            min={0}
+            max={2}
+            step={0.1}
+            value={active.temperature}
+            disabled={!active.temperatureEnabled}
+            onChange={(e) => updateActive({ temperature: parseFloat(e.target.value) })}
+            style={{ flex: 1, opacity: active.temperatureEnabled ? 1 : 0.4 }}
+          />
+          <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{t("tempCreative")}</span>
+        </div>
         <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
           <button
             className="ghost"
@@ -1595,6 +1683,10 @@ export default function ChatPanel({
           >
             <Wand2 size={15} className={improving ? "typing" : undefined} />
           </button>
+          <button className="ghost library-trigger" title={t("skillsLibrary")} onClick={() => setLibraryOpen(true)} style={{ color: activeProject && enabledLibraryCount(skills, activeProject.id) ? "var(--accent)" : undefined }}>
+            <Library size={15} />
+            {activeProject && enabledLibraryCount(skills, activeProject.id) > 0 && <span className="count">{enabledLibraryCount(skills, activeProject.id)}</span>}
+          </button>
           <div style={{ position: "relative" }}>
             <button
               className="ghost"
@@ -1618,6 +1710,8 @@ export default function ChatPanel({
                   padding: 10,
                   boxShadow: "0 4px 16px rgba(0,0,0,0.3)",
                   zIndex: 20,
+                  maxHeight: "min(420px, 65vh)",
+                  overflowY: "auto",
                 }}
               >
                 <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: mcpServers.length ? 10 : 0 }}>
@@ -1634,7 +1728,11 @@ export default function ChatPanel({
                     <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 6 }}>{t("mcpServersTitle")}</div>
                     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                       {mcpServers.map((s) => (
-                        <label key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}>
+                        <label
+                          key={s.id}
+                          title={mcpHealth[s.id]?.error}
+                          style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}
+                        >
                           <input
                             type="checkbox"
                             checked={s.enabled}
@@ -1644,7 +1742,22 @@ export default function ChatPanel({
                               )
                             }
                           />
-                          {s.name}
+                          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {s.name}
+                          </span>
+                          {s.enabled && mcpHealth[s.id]?.state === "checking" && (
+                            <RotateCw size={11} className="typing" aria-label={t("mcpChecking")} />
+                          )}
+                          {s.enabled && mcpHealth[s.id]?.state === "connected" && (
+                            <span title={t("mcpConnected")} style={{ color: "#22c55e", fontSize: 10 }}>
+                              ● {mcpHealth[s.id].toolCount}
+                            </span>
+                          )}
+                          {s.enabled && mcpHealth[s.id]?.state === "error" && (
+                            <span title={mcpHealth[s.id].error ?? t("mcpUnavailable")} style={{ color: "var(--red)", fontSize: 10 }}>
+                              ●
+                            </span>
+                          )}
                         </label>
                       ))}
                     </div>
@@ -1653,6 +1766,55 @@ export default function ChatPanel({
               </div>
             )}
           </div>
+          {activeSkillItems.length > 0 && (
+            <div className="active-library-summary" style={{ position: "relative" }}>
+              <label className={`skill-persist-toggle${keepSelectedSkills ? " enabled" : ""}`} title={keepSelectedSkills ? t("keepSkillsEnabled") : t("keepSkillsDisabled")}>
+                <input
+                  type="checkbox"
+                  checked={keepSelectedSkills}
+                  onChange={(event) => {
+                    const next = event.target.checked;
+                    setKeepSelectedSkills(next);
+                    localStorage.setItem(`${KEEP_SKILLS_KEY}${activeProject?.id ?? activeProjectId}`, next ? "1" : "0");
+                  }}
+                />
+                <span />
+              </label>
+              <button
+                className={`active-library-pill${selectedSkillItems.length ? " selected" : ""}`}
+                onClick={() => setShowSkillPicker((value) => !value)}
+                title={activeSkillItems.map(libraryDisplayName).join("\n")}
+              >
+                {selectedSkillItems.length}/{activeSkillItems.length} {t("activeSkills")}
+              </button>
+              {showSkillPicker && (
+                <div className="skill-quick-picker">
+                  <div className="skill-quick-picker-title">
+                    <span>{t("activeSkills")}</span>
+                    <button className="ghost" onClick={() => setSelectedSkillIds(new Set())}>{t("clear")}</button>
+                  </div>
+                  {activeSkillItems.map((skill) => (
+                    <label key={skill.id} title={skill.bundleRoot}>
+                      <input
+                        type="checkbox"
+                        checked={selectedSkillIds.has(skill.id)}
+                        onChange={(event) => setSelectedSkillIds((current) => {
+                          const next = new Set(current);
+                          event.target.checked ? next.add(skill.id) : next.delete(skill.id);
+                          return next;
+                        })}
+                      />
+                      <span>{libraryDisplayName(skill)}</span>
+                    </label>
+                  ))}
+                  <button className="ghost skill-picker-manage" onClick={() => { setShowSkillPicker(false); setLibraryOpen(true); }}>
+                    <Settings2 size={12} /> {t("skillsLibrary")}
+                  </button>
+                  <small>{keepSelectedSkills ? t("keepSkillsEnabled") : t("keepSkillsDisabled")}</small>
+                </div>
+              )}
+            </div>
+          )}
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
           {recording ? (
@@ -1667,7 +1829,7 @@ export default function ChatPanel({
                 borderRadius: 8,
               }}
             >
-              <VoiceWaveform stream={micStream} />
+              <VoiceWaveform stream={null} active />
             </div>
           ) : (
             <textarea
@@ -1697,10 +1859,6 @@ export default function ChatPanel({
               }
               disabled={transcribingMic || micConnecting || !projectDir}
               onClick={toggleRecording}
-              onMouseEnter={prewarmMic}
-              onMouseLeave={() => {
-                if (!recording) releasePrewarmedMic();
-              }}
             >
               <Mic size={15} className={recording || micConnecting || transcribingMic ? "typing" : undefined} />
             </button>
@@ -1745,7 +1903,6 @@ export default function ChatPanel({
             </span>
           )}
           <span>{model}</span>
-          <span>{sanitizeEffort(active.reasoningEffort)}</span>
           {active.autoApprove && <span style={{ color: "var(--amber)" }}>{t("autoApproveOn")}</span>}
         </div>
       </div>
@@ -1763,13 +1920,13 @@ export default function ChatPanel({
         <SettingsModal
           settings={{
             systemPrompt: active.systemPrompt,
-            reasoningEffort: sanitizeEffort(active.reasoningEffort),
-            temperature: active.temperature,
             autoApprove: active.autoApprove,
             contextBudget: active.contextBudget || 200_000,
           }}
           onClose={() => setShowSettings(false)}
           onSave={(s: SessionSettings) => updateActive(s)}
+          lowPowerMode={lowPowerMode}
+          onLowPowerModeChange={onLowPowerModeChange}
         />
       )}
       {showPromptLab && (
@@ -1778,6 +1935,14 @@ export default function ChatPanel({
           providers={providers}
           onClose={() => setShowPromptLab(false)}
           onInsert={(text) => setInput(text)}
+        />
+      )}
+      {libraryOpen && activeProject && (
+        <LibraryModal
+          projectId={activeProject.id}
+          workspace={activeProject.directory}
+          onClose={() => setLibraryOpen(false)}
+          onChanged={(items) => setSkills([...items])}
         />
       )}
       {showProjectSettings && activeProject && (

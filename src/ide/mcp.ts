@@ -27,6 +27,48 @@ export type McpServer = {
 export type McpToolInfo = { name: string; description: string; inputSchema: any };
 
 const MCP_SERVERS_KEY = "mahi_mcp_servers";
+export const STUDIO_MCP_DIR_KEY = "mahi_studio_mcp_dir";
+const MCP_MIGRATION_KEY = "mahi_mcp_migration";
+const CURRENT_MCP_MIGRATION = 1;
+
+const STUDIO_MCP_PRESETS: { id: string; name: string; entry: string; env?: Record<string, string> }[] = [
+  { id: "studio-photoshop", name: "Photoshop", entry: "photoshop/index.mjs" },
+  { id: "studio-afterfx", name: "After Effects", entry: "afterfx/index.mjs" },
+  { id: "studio-premiere", name: "Premiere Pro", entry: "premiere/index.mjs" },
+  { id: "studio-obs", name: "OBS", entry: "obs/index.mjs", env: { OBS_WS_PASSWORD: "" } },
+];
+
+export function mergeStudioMcpServers(servers: McpServer[], rawDir: string): McpServer[] {
+  const dir = rawDir.trim().replace(/\/+$/, "");
+  if (!dir) return servers;
+  const next: McpServer[] = servers.map((server) => ({
+    ...server,
+    env: server.env ? { ...server.env } : undefined,
+  }));
+  for (const preset of STUDIO_MCP_PRESETS) {
+    const server: McpServer = {
+      id: preset.id,
+      name: preset.name,
+      enabled: true,
+      transport: "stdio",
+      command: "node",
+      args: [`${dir}/${preset.entry}`],
+      env: preset.env,
+    };
+    const existing = next.findIndex((item) => item.id === preset.id);
+    // Refresh managed paths while preserving user choices and secrets.
+    if (existing >= 0) {
+      next[existing] = {
+        ...server,
+        enabled: next[existing].enabled,
+        env: { ...(preset.env ?? {}), ...(next[existing].env ?? {}) },
+      };
+    } else {
+      next.push(server);
+    }
+  }
+  return next;
+}
 
 // Z.AI's devpack MCP servers (https://docs.z.ai/devpack/mcp/*) — vision,
 // web search, web reader, and zread (GitHub repo docs/search). All four use
@@ -71,14 +113,28 @@ export function defaultMcpServers(zaiApiKey: string): McpServer[] {
 }
 
 export function loadMcpServers(zaiApiKey: string): McpServer[] {
+  let servers: McpServer[];
   try {
     const raw = localStorage.getItem(MCP_SERVERS_KEY);
-    if (!raw) return defaultMcpServers(zaiApiKey);
+    if (!raw) servers = defaultMcpServers(zaiApiKey);
+    else {
     const parsed: McpServer[] = JSON.parse(raw);
-    return parsed.length ? parsed : defaultMcpServers(zaiApiKey);
+      servers = parsed.length ? parsed : defaultMcpServers(zaiApiKey);
+    }
   } catch {
-    return defaultMcpServers(zaiApiKey);
+    servers = defaultMcpServers(zaiApiKey);
   }
+
+  // One-time migration for users who installed the Studio bundle in an
+  // earlier version but whose saved MCP list still only contains Z.AI.
+  const migration = Number(localStorage.getItem(MCP_MIGRATION_KEY) ?? "0");
+  if (migration < CURRENT_MCP_MIGRATION) {
+    const studioDir = localStorage.getItem(STUDIO_MCP_DIR_KEY) ?? "";
+    if (studioDir) servers = mergeStudioMcpServers(servers, studioDir);
+    localStorage.setItem(MCP_MIGRATION_KEY, String(CURRENT_MCP_MIGRATION));
+    localStorage.setItem(MCP_SERVERS_KEY, JSON.stringify(servers));
+  }
+  return servers;
 }
 
 export function saveMcpServers(servers: McpServer[]) {
@@ -121,6 +177,8 @@ export function invalidateMcpToolCache(serverId?: string) {
 }
 
 const MCP_PREFIX = "mcp__";
+const MAX_TOOL_NAME_LEN = 64;
+const mcpNameRegistry = new Map<string, { serverId: string; toolName: string }>();
 
 function encodeMcpPart(value: string): string {
   // Function names may only contain letters/numbers/underscore and must be
@@ -138,11 +196,32 @@ function decodeMcpPart(value: string): string | null {
   return new TextDecoder().decode(bytes);
 }
 
+function shortHash(value: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function safeMcpToolPart(toolName: string): string {
+  return (toolName || "tool").replace(/[^A-Za-z0-9_-]/g, "_") || "tool";
+}
+
 function mcpFnName(serverId: string, toolName: string): string {
-  return `${MCP_PREFIX}${encodeMcpPart(serverId)}__${toolName}`;
+  const serverPart = encodeMcpPart(serverId);
+  const suffix = `_${shortHash(`${serverId}\u0000${toolName}`)}`;
+  const available = Math.max(1, MAX_TOOL_NAME_LEN - MCP_PREFIX.length - serverPart.length - 2 - suffix.length);
+  const toolPart = safeMcpToolPart(toolName).slice(0, available);
+  const fnName = `${MCP_PREFIX}${serverPart}__${toolPart}${suffix}`;
+  mcpNameRegistry.set(fnName, { serverId, toolName });
+  return fnName;
 }
 
 function parseMcpFnName(fnName: string): { serverId: string; toolName: string } | null {
+  const registered = mcpNameRegistry.get(fnName);
+  if (registered) return registered;
   if (!fnName.startsWith(MCP_PREFIX)) return null;
   const rest = fnName.slice(MCP_PREFIX.length);
   const sep = rest.indexOf("__");
@@ -158,11 +237,24 @@ export function isMcpToolName(fnName: string): boolean {
   return fnName.startsWith(MCP_PREFIX);
 }
 
+export function mcpToolIdentity(fnName: string): { serverId: string; toolName: string } | null {
+  return parseMcpFnName(fnName);
+}
+
 // Builds one function-tool entry per discovered tool across all enabled
 // servers. A server whose discovery fails (bad key, npx missing, host
 // unreachable) just contributes no tools to this turn instead of failing it
 // — same "degrade, don't block" precedent as browser tools being entirely
 // optional.
+function asObjectSchema(schema: any): any {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return { type: "object", properties: {} };
+  const out = { ...schema };
+  if (out.type && out.type !== "object") return { type: "object", properties: {} };
+  out.type = "object";
+  if (!out.properties || typeof out.properties !== "object" || Array.isArray(out.properties)) out.properties = {};
+  return out;
+}
+
 export async function buildMcpTools(servers: McpServer[]): Promise<OpenAI.Chat.Completions.ChatCompletionTool[]> {
   const enabled = servers.filter((s) => s.enabled);
   const perServer = await Promise.all(
@@ -181,11 +273,8 @@ export async function buildMcpTools(servers: McpServer[]): Promise<OpenAI.Chat.C
         type: "function" as const,
         function: {
           name: mcpFnName(s.id, tool.name),
-          description: `[${s.name}] ${tool.description}`,
-          parameters:
-            tool.inputSchema && typeof tool.inputSchema === "object"
-              ? tool.inputSchema
-              : { type: "object", properties: {} },
+          description: `[${s.name}] ${tool.description || tool.name}`,
+          parameters: asObjectSchema(tool.inputSchema),
         },
       }));
     })

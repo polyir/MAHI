@@ -37,6 +37,7 @@ export default function EditorArea({
   onNewBrowserTab,
   onTranscribe,
   fileVersions,
+  lowPowerMode,
 }: {
   workspace: string;
   tabs: EditorTab[];
@@ -57,6 +58,7 @@ export default function EditorArea({
   // changed on disk — busts the asset:// preview cache for exactly that
   // file (see ImagePreview/MediaPreview/PdfPreview's cacheBust prop).
   fileVersions: Record<string, number>;
+  lowPowerMode: boolean;
 }) {
   useLang();
   const [transcribing, setTranscribing] = useState(false);
@@ -188,13 +190,13 @@ export default function EditorArea({
           options={{
             fontSize: 13,
             fontFamily: "SF Mono, Menlo, Monaco, monospace",
-            minimap: { enabled: true, renderCharacters: false },
+            minimap: { enabled: !lowPowerMode, renderCharacters: false },
             scrollBeyondLastLine: false,
             automaticLayout: true,
             tabSize: 2,
             renderWhitespace: "selection",
-            smoothScrolling: true,
-            cursorBlinking: "smooth",
+            smoothScrolling: !lowPowerMode,
+            cursorBlinking: lowPowerMode ? "solid" : "smooth",
             padding: { top: 8 },
           }}
         />
@@ -204,7 +206,7 @@ export default function EditorArea({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0, background: "var(--bg-0)" }}>
-      <div className="tabs">
+      <div className={`tabs ${tabs.length + browserTabs.length > 6 ? "tabs-dense" : ""} ${tabs.length + browserTabs.length > 10 ? "tabs-very-dense" : ""}`}>
         {tabs.map((tab, i) => {
           const dirty = isDirty(tab);
           return (
@@ -248,7 +250,7 @@ export default function EditorArea({
             </span>
           </div>
         ))}
-        <div className="tab" onClick={onNewBrowserTab} title={t("browserTitle")}>
+        <div className="tab tab-add" onClick={onNewBrowserTab} title={t("browserTitle")}>
           <Plus size={13} />
         </div>
       </div>
@@ -309,7 +311,7 @@ export default function EditorArea({
             </div>
           ))}
         {browserTabs.map((bt) => (
-          <BrowserTabView key={bt.id} tab={bt} isActive={bt.id === activeBrowserId} />
+          <BrowserTabView key={bt.id} tab={bt} isActive={bt.id === activeBrowserId} lowPowerMode={lowPowerMode} />
         ))}
       </div>
     </div>

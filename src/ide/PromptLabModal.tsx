@@ -9,7 +9,7 @@ import { improvePromptSystem, loadImproveModel, loadImproveProviderId, localComp
 import { loadSavedPrompts, saveSavedPrompts } from "./promptLab";
 import type { SavedPrompt } from "./promptLab";
 import { FINAL_PROMPT_END, FINAL_PROMPT_START, PROMPT_TEMPLATES } from "./templates";
-import { makeClient } from "../agent";
+import { providerComplete } from "../agent";
 
 type LabMsg = { role: "system" | "user" | "assistant"; content: string };
 type Version = { id: string; label: string; content: string };
@@ -85,15 +85,7 @@ export default function PromptLabModal({
 
   async function cloudMulti(p: Provider, model: string, msgs: LabMsg[]): Promise<string | null> {
     try {
-      const client = makeClient(p.apiKey, p.baseURL);
-      const resp = await client.chat.completions.create({
-        model: model || p.models[0],
-        messages: msgs,
-        stream: false,
-        max_tokens: 1200,
-        temperature: 0.3,
-      });
-      return resp.choices[0]?.message?.content?.trim() || null;
+      return await providerComplete(p, model || p.models[0], msgs, { maxTokens: 1200, temperature: 0.3 });
     } catch {
       return null;
     }

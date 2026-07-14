@@ -1,8 +1,11 @@
 mod asr;
 mod browser;
 mod checkpoint;
+mod library;
 mod llm;
 mod mcp;
+mod microphone;
+mod mcp_servers;
 mod media;
 mod models;
 mod pty;
@@ -10,6 +13,7 @@ mod screenshot;
 mod sessions;
 mod tts;
 mod watcher;
+mod window_vision;
 
 use regex::Regex;
 use serde::Serialize;
@@ -471,11 +475,13 @@ pub fn run() {
         .manage(pty::PtyManager::default())
         .manage(checkpoint::CheckpointManager::default())
         .manage(models::ModelManager::default())
+        .manage(mcp_servers::McpServersInstallGuard::default())
         .manage(asr::AsrManager::default())
         .manage(tts::TtsManager::default())
         .manage(watcher::WatcherManager::default())
         .manage(llm::LlamaManager::default())
         .manage(browser::PickerManager::default())
+        .manage(window_vision::WindowVisionManager::default())
         .invoke_handler(tauri::generate_handler![
             read_file,
             register_asset_scope,
@@ -503,11 +509,27 @@ pub fn run() {
             models::model_download,
             models::model_list_status,
             models::model_delete,
+            mcp_servers::mcp_servers_status,
+            mcp_servers::mcp_servers_install,
             asr::transcribe_media,
+            microphone::microphone_start,
+            microphone::microphone_level,
+            microphone::microphone_stop,
+            microphone::microphone_read,
             tts::synthesize_speech,
             watcher::watch_workspace,
             llm::local_llm_ensure,
             llm::local_llm_stop,
+            library::library_list,
+            library::library_load_images,
+            library::library_copy_asset,
+            library::library_import_directory,
+            library::library_clone,
+            library::library_remove,
+            library::library_update,
+            library::library_save_project_map,
+            library::git_lfs_status,
+            library::git_lfs_install,
             sessions::sessions_load,
             sessions::sessions_save,
             browser::browser_open,
@@ -515,9 +537,31 @@ pub fn run() {
             browser::browser_navigate,
             browser::browser_hide,
             browser::browser_close,
+            browser::browser_dom_snapshot,
+            browser::browser_click,
+            browser::browser_type,
+            browser::browser_submit,
+            browser::browser_scroll,
+            browser::browser_key,
             browser::browser_start_picker,
             browser::browser_stop_picker,
             browser::browser_capture_element_screenshot,
+            window_vision::window_vision_capabilities,
+            window_vision::window_vision_request_permission,
+            window_vision::window_vision_allowed_apps,
+            window_vision::window_vision_present_picker,
+            window_vision::window_vision_picker_result,
+            window_vision::window_vision_remove_allowed_app,
+            window_vision::window_vision_list_allowed_windows,
+            window_vision::window_vision_observe_app,
+            window_vision::window_vision_start_group,
+            window_vision::window_vision_sessions,
+            window_vision::window_vision_capture,
+            window_vision::window_vision_wait_for_change,
+            window_vision::window_vision_stop,
+            window_vision::window_vision_stop_all,
+            window_vision::window_vision_detect_dialogs,
+            window_vision::window_vision_auto_prepare,
             mcp::mcp_list_tools,
             mcp::mcp_call_tool,
             open_console_window
@@ -532,6 +576,7 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event {
                 use tauri::Manager;
                 llm::kill_all(app.state::<llm::LlamaManager>().inner());
+                window_vision::stop_all();
             }
         });
 }

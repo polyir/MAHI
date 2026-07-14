@@ -7,7 +7,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { ModelStatus } from "./models";
-import { LOCAL_PROVIDER_ID } from "./providers";
+import { canonicalProviderId, LOCAL_PROVIDER_ID } from "./providers";
 
 export const QWEN_1_7B = "qwen3-1.7b";
 export const QWEN_4B = "qwen3-4b";
@@ -77,7 +77,7 @@ const IMPROVE_PROVIDER_KEY = "mahi_improve_provider_id";
 const IMPROVE_MODEL_KEY = "mahi_improve_model";
 
 export function loadImproveProviderId(): string {
-  return localStorage.getItem(IMPROVE_PROVIDER_KEY) ?? LOCAL_PROVIDER_ID;
+  return canonicalProviderId(localStorage.getItem(IMPROVE_PROVIDER_KEY) ?? LOCAL_PROVIDER_ID);
 }
 export function saveImproveProviderId(id: string): void {
   localStorage.setItem(IMPROVE_PROVIDER_KEY, id);
@@ -98,7 +98,7 @@ const DICTATION_PROVIDER_KEY = "mahi_dictation_provider_id";
 const DICTATION_MODEL_KEY = "mahi_dictation_model";
 
 export function loadDictationProviderId(): string {
-  return localStorage.getItem(DICTATION_PROVIDER_KEY) ?? LOCAL_PROVIDER_ID;
+  return canonicalProviderId(localStorage.getItem(DICTATION_PROVIDER_KEY) ?? LOCAL_PROVIDER_ID);
 }
 export function saveDictationProviderId(id: string): void {
   localStorage.setItem(DICTATION_PROVIDER_KEY, id);

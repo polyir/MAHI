@@ -35,7 +35,7 @@ export type BrowserTab = { id: string; url: string; title: string };
 // Tauri's child-webview positioning has historically been able to extend a
 // wide webview slightly past its intended top edge, covering whatever sits
 // directly above it.
-export default function BrowserTabView({ tab, isActive }: { tab: BrowserTab; isActive: boolean }) {
+export default function BrowserTabView({ tab, isActive, lowPowerMode }: { tab: BrowserTab; isActive: boolean; lowPowerMode: boolean }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const openedRef = useRef(false);
   const modalOpenRef = useRef(false);
@@ -91,6 +91,18 @@ export default function BrowserTabView({ tab, isActive }: { tab: BrowserTab; isA
     applyVisibility();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isActive]);
+
+  // In low-power mode, a hidden page is fully unloaded after a short grace
+  // period. Activating the tab recreates it at its current URL. Cookies and
+  // login sessions survive because they belong to WebKit's shared store.
+  useEffect(() => {
+    if (!lowPowerMode || isActive || !openedRef.current) return;
+    const timer = window.setTimeout(() => {
+      invoke("browser_close", { tabId: tab.id }).catch(() => {});
+      openedRef.current = false;
+    }, 15_000);
+    return () => window.clearTimeout(timer);
+  }, [isActive, lowPowerMode, tab.id]);
 
   // Unlike an iframe's `src`, a native webview doesn't re-navigate just
   // because a prop changed — the address bar (EditorArea's goAddress) and
