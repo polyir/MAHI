@@ -137,6 +137,10 @@ Some target applications still require their own one-time configuration:
 - Microphone access is requested only when dictation is used.
 - Imported Adapter Studio requests reject shell operators and private-network targets, and credentials are redacted from generated configuration previews.
 
+## Contributors
+
+- [OpenAI Codex](https://github.com/openai/codex) — AI coding contributor
+
 ## License
 
 [Apache-2.0](LICENSE)
@@ -276,6 +280,10 @@ npm run tauri dev
 - Window Vision فقط یک‌بار مجوز Screen Recording می‌خواهد و تنها پنجره‌های واجد شرایط و محافظت‌نشده را می‌گیرد.
 - دسترسی میکروفون فقط هنگام استفاده از دیکته درخواست می‌شود.
 - Adapter Studio عملگرهای شل و مقصدهای شبکه‌ی خصوصی را رد و credentialها را از پیش‌نمایش تنظیمات حذف می‌کند.
+
+## مشارکت‌کنندگان
+
+- [OpenAI Codex](https://github.com/openai/codex) — مشارکت‌کننده‌ی هوش مصنوعی در توسعه
 
 ## لایسنس
 
