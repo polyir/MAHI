@@ -23,6 +23,26 @@ use tokio::process::Command;
 
 const IGNORED_DIRS: [&str; 5] = [".git", "node_modules", "target", "dist", ".next"];
 
+/// Files larger than this are skipped by content search: they are almost
+/// never what the user is grepping for (bundles, lockfile blobs, media) and
+/// reading them stalls the search on slow disks / cloud-synced placeholders.
+const MAX_SEARCH_FILE_LEN: u64 = 1_500_000;
+
+/// Read a file as text for searching, or None when it should be skipped:
+/// too large, unreadable, binary (NUL bytes in the head), or not UTF-8.
+/// The metadata check comes first so oversized files are never opened at all.
+fn read_search_text(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if meta.len() > MAX_SEARCH_FILE_LEN {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.iter().take(8192).any(|&b| b == 0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
 pub(crate) fn is_ignored(name: &str) -> bool {
     name.starts_with('.') && name != "." || IGNORED_DIRS.contains(&name)
 }
@@ -140,10 +160,16 @@ pub(crate) fn ensure_not_workspace_root(workspace: &str, path: &Path) -> Result<
     Ok(())
 }
 
+// async + spawn_blocking: sync commands are serviced on the main thread by
+// the webview's custom-protocol handler, so a read that stalls (huge file,
+// slow disk, an iCloud/File Provider placeholder that must download first)
+// froze the entire UI. The blocking pool absorbs the wait instead.
 #[tauri::command]
-fn read_file(workspace: String, path: String) -> Result<String, String> {
+async fn read_file(workspace: String, path: String) -> Result<String, String> {
     let p = resolve(&workspace, &path)?;
-    fs::read_to_string(p).map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || fs::read_to_string(p).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Grant the asset:// protocol read access to a workspace directory, so the
@@ -170,7 +196,7 @@ fn write_file(workspace: String, path: String, content: String) -> Result<(), St
 }
 
 #[tauri::command]
-fn edit_file(
+async fn edit_file(
     workspace: String,
     path: String,
     old_string: String,
@@ -178,6 +204,17 @@ fn edit_file(
     replace_all: bool,
 ) -> Result<(), String> {
     let p = resolve(&workspace, &path)?;
+    tauri::async_runtime::spawn_blocking(move || edit_file_blocking(p, old_string, new_string, replace_all))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn edit_file_blocking(
+    p: PathBuf,
+    old_string: String,
+    new_string: String,
+    replace_all: bool,
+) -> Result<(), String> {
     let content = fs::read_to_string(&p).map_err(|e| e.to_string())?;
     let count = content.matches(old_string.as_str()).count();
     if count == 0 {
@@ -304,8 +341,24 @@ async fn run_command(workspace: String, cmd: String) -> Result<CmdOutput, String
     })
 }
 
+// async + spawn_blocking: this walked and read every workspace file on the
+// main thread — one stalled read() (huge file, slow volume, cloud-synced
+// placeholder) beachballed the whole app for the duration of the search.
 #[tauri::command]
-fn search_files(
+async fn search_files(
+    workspace: String,
+    query: String,
+    is_regex: Option<bool>,
+    max_results: Option<usize>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        search_files_blocking(workspace, query, is_regex, max_results)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn search_files_blocking(
     workspace: String,
     query: String,
     is_regex: Option<bool>,
@@ -326,9 +379,9 @@ fn search_files(
 
     let mut results: Vec<String> = Vec::new();
     'outer: for f in files {
-        let content = match fs::read_to_string(&f) {
-            Ok(c) => c,
-            Err(_) => continue, // skip binary/unreadable files
+        let content = match read_search_text(&f) {
+            Some(c) => c,
+            None => continue, // skip oversized/binary/unreadable files
         };
         let rel = f
             .strip_prefix(&base)
@@ -358,7 +411,17 @@ fn search_files(
 }
 
 #[tauri::command]
-fn glob_files(
+async fn glob_files(
+    workspace: String,
+    pattern: String,
+    max_results: Option<usize>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || glob_files_blocking(workspace, pattern, max_results))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn glob_files_blocking(
     workspace: String,
     pattern: String,
     max_results: Option<usize>,
@@ -400,24 +463,28 @@ fn glob_files(
 /// A flat, sorted list of the project's files (relative paths), capped so it
 /// can be injected into the model's context as lightweight project awareness.
 #[tauri::command]
-fn project_tree(workspace: String, max_entries: Option<usize>) -> Result<String, String> {
-    let base = Path::new(&workspace)
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
-    let cap = max_entries.unwrap_or(250);
-    let mut files = Vec::new();
-    walk_collect(&base, &mut files, cap);
-    let mut rels: Vec<String> = files
-        .iter()
-        .map(|f| {
-            f.strip_prefix(&base)
-                .unwrap_or(f)
-                .to_string_lossy()
-                .to_string()
-        })
-        .collect();
-    rels.sort();
-    Ok(rels.join("\n"))
+async fn project_tree(workspace: String, max_entries: Option<usize>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base = Path::new(&workspace)
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let cap = max_entries.unwrap_or(250);
+        let mut files = Vec::new();
+        walk_collect(&base, &mut files, cap);
+        let mut rels: Vec<String> = files
+            .iter()
+            .map(|f| {
+                f.strip_prefix(&base)
+                    .unwrap_or(f)
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        rels.sort();
+        Ok(rels.join("\n"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Open a provider's own console page (billing/usage) in an in-app window.
