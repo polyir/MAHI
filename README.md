@@ -67,6 +67,16 @@ MAHI is a native macOS desktop IDE built with Tauri, React, and Rust. It combine
 - Approval-gated asset copying lets the agent move a referenced Skill asset into the workspace with checkpoint support.
 - Git LFS state is shown in the library, with an optional checksum-verified managed installer.
 
+#### Recommended Skills
+
+| Skill | Repository |
+|---|---|
+| After Effects | [polyir/skill-after-effects](https://github.com/polyir/skill-after-effects) |
+| Creative App Adapter | [polyir/skill-creative-app-adapter](https://github.com/polyir/skill-creative-app-adapter) |
+| OBS Studio | [polyir/skill-obs-studio](https://github.com/polyir/skill-obs-studio) |
+| Photoshop | [polyir/skill-photoshop](https://github.com/polyir/skill-photoshop) |
+| Premiere Pro | [polyir/skill-premiere-pro](https://github.com/polyir/skill-premiere-pro) |
+
 ### Browser, voice, and file experience
 
 - Multiple native browser tabs can live beside editor tabs and retain shared WebKit sessions.
@@ -196,6 +206,16 @@ Some target applications still require their own one-time configuration:
 - سوییچ persistence می‌تواند انتخاب فعلی Skill را برای پیام‌های بعدی همان پروژه حفظ کند.
 - کپی asset از Skill به workspace نیازمند تأیید است و checkpoint دارد.
 - وضعیت Git LFS در کتابخانه نمایش داده می‌شود و نصب‌کننده‌ی مدیریت‌شده با checksum هم وجود دارد.
+
+#### اسکیل‌های پیشنهادی
+
+| اسکیل | مخزن |
+|---|---|
+| After Effects | [polyir/skill-after-effects](https://github.com/polyir/skill-after-effects) |
+| Creative App Adapter | [polyir/skill-creative-app-adapter](https://github.com/polyir/skill-creative-app-adapter) |
+| OBS Studio | [polyir/skill-obs-studio](https://github.com/polyir/skill-obs-studio) |
+| Photoshop | [polyir/skill-photoshop](https://github.com/polyir/skill-photoshop) |
+| Premiere Pro | [polyir/skill-premiere-pro](https://github.com/polyir/skill-premiere-pro) |
 
 ### مرورگر، صدا و فایل‌ها
 
