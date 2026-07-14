@@ -2,7 +2,7 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { Volume2 } from "lucide-react";
+import { Check, Copy, Volume2 } from "lucide-react";
 import { Msg } from "../agent";
 import ToolCallView from "./ToolCallView";
 import CodeBlock from "./CodeBlock";
@@ -24,6 +24,13 @@ export default function Message({
   const [speaking, setSpeaking] = useState(false);
   const [audioSrc, setAudioSrc] = useState<string | null>(null);
   const [speakError, setSpeakError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  async function copyMessage() {
+    await navigator.clipboard.writeText(msg.content);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1400);
+  }
 
   async function speak() {
     if (speaking) return;
@@ -91,6 +98,12 @@ export default function Message({
         {msg.content.includes("[Attached file:") && (
           <div style={{ fontSize: 11, opacity: 0.75, marginTop: 4 }}>{t("withAttachment")}</div>
         )}
+        <div className="message-actions">
+          <button className="ghost" onClick={copyMessage} title={t(copied ? "messageCopied" : "copyMessage")}>
+            {copied ? <Check size={12} /> : <Copy size={12} />}
+            <span>{t(copied ? "messageCopied" : "copyMessage")}</span>
+          </button>
+        </div>
       </div>
     );
   }
@@ -110,7 +123,11 @@ export default function Message({
           {msg.content}
         </ReactMarkdown>
       </div>
-      <div style={{ marginTop: 4 }}>
+      <div className="message-actions">
+        <button className="ghost" onClick={copyMessage} title={t(copied ? "messageCopied" : "copyMessage")}>
+          {copied ? <Check size={12} /> : <Copy size={12} />}
+          <span>{t(copied ? "messageCopied" : "copyMessage")}</span>
+        </button>
         <button className="ghost" onClick={speak} disabled={speaking} title={t("speakButton")} style={{ padding: "2px 6px" }}>
           <Volume2 size={12} className={speaking ? "typing" : undefined} />
         </button>

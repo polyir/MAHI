@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>MAHI uses the microphone to let you dictate messages to the chat instead of typing.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>MAHI uses screen access to observe and verify the application windows you ask it to work with.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>MAHI uses the microphone only when you press the dictation button.</string>
 </dict>
 </plist>

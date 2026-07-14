@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import DiffView from "./DiffView";
 import { t, dir as uiDir, useLang } from "../ide/i18n";
+import { useModalOpen } from "../ide/modalTracker";
 
 export type PendingApproval = {
   toolName: string;
@@ -18,6 +19,7 @@ export default function ApprovalModal({
   onDecide: (approved: boolean) => void;
 }) {
   useLang();
+  useModalOpen(true);
   const [oldContent, setOldContent] = useState<string | null>(null);
 
   useEffect(() => {
@@ -42,10 +44,12 @@ export default function ApprovalModal({
             ? t("approvalDelete")
             : pending.toolName === "move_file"
             ? t("approvalMove")
-            : ["generate_image", "generate_audio", "generate_video", "speak_text"].includes(pending.toolName)
+            : ["generate_image", "generate_audio", "generate_video", "generate_music", "generate_sound_effect", "speak_text"].includes(pending.toolName)
             ? t("approvalGenerate")
-            : ["browser_navigate", "browser_close"].includes(pending.toolName)
+            : ["browser_navigate", "browser_close", "browser_submit"].includes(pending.toolName)
             ? t("approvalBrowser")
+            : pending.toolName === "call_model"
+            ? t("approvalCallModel")
             : t("approvalEdit")}
         </h3>
 
@@ -72,6 +76,11 @@ export default function ApprovalModal({
               : `move: ${pending.args.from} → ${pending.args.to}`}
           </pre>
         )}
+        {pending.toolName === "copy_library_asset" && (
+          <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 12, whiteSpace: "pre-wrap" }}>
+            {pending.args.source}{"\n"}→ {pending.args.path}
+          </pre>
+        )}
 
         {pending.toolName === "edit_file" && (
           <>
@@ -80,7 +89,7 @@ export default function ApprovalModal({
           </>
         )}
 
-        {["generate_image", "generate_audio", "generate_video", "speak_text"].includes(pending.toolName) && (
+        {["generate_image", "generate_audio", "generate_video", "generate_music", "generate_sound_effect", "speak_text"].includes(pending.toolName) && (
           <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>
             "{pending.args.prompt ?? pending.args.text}" → {pending.args.path}
           </pre>
@@ -94,6 +103,17 @@ export default function ApprovalModal({
         {pending.toolName === "browser_close" && (
           <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13 }}>
             close: {pending.args.tab_id ? `tab ${pending.args.tab_id}` : "active tab"}
+          </pre>
+        )}
+        {pending.toolName === "browser_submit" && (
+          <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>
+            submit/click: {pending.args.selector} ({pending.args.tab_id ? `tab ${pending.args.tab_id}` : "active tab"})
+          </pre>
+        )}
+
+        {pending.toolName === "call_model" && (
+          <pre dir="ltr" style={{ background: "var(--bg-0)", padding: 10, borderRadius: 8, fontSize: 13, whiteSpace: "pre-wrap" }}>
+            {pending.args.provider_id}/{pending.args.model}:{"\n"}"{pending.args.prompt}"
           </pre>
         )}
 

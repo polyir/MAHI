@@ -1,11 +1,11 @@
-import { useState } from "react";
-import { ReasoningEffort } from "../agent";
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { t, dir, useLang, getLang, setLang, LANGS, Lang } from "../ide/i18n";
+import { useModalOpen } from "../ide/modalTracker";
+import WindowVisionSettings from "../ide/WindowVisionSettings";
 
 export type SessionSettings = {
   systemPrompt: string;
-  reasoningEffort: ReasoningEffort;
-  temperature: number;
   autoApprove: boolean;
   contextBudget: number;
 };
@@ -14,17 +14,32 @@ export default function SettingsModal({
   settings,
   onSave,
   onClose,
+  lowPowerMode,
+  onLowPowerModeChange,
 }: {
   settings: SessionSettings;
   onSave: (s: SessionSettings) => void;
   onClose: () => void;
+  lowPowerMode: boolean;
+  onLowPowerModeChange: (enabled: boolean) => void;
 }) {
   useLang();
+  useModalOpen(true);
   const [local, setLocal] = useState<SessionSettings>(settings);
+  const [localLowPower, setLocalLowPower] = useState(lowPowerMode);
+  // Read at runtime rather than imported from package.json/tauri.conf.json
+  // directly — this reflects whatever build is ACTUALLY running right now,
+  // which is exactly the point: it's the one place to confirm an update
+  // really took effect (a self-update swaps the binary but there's
+  // otherwise no visible difference to check against).
+  const [appVersion, setAppVersion] = useState("");
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion(""));
+  }, []);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" dir={dir()} style={{ width: 480 }} onClick={(e) => e.stopPropagation()}>
+      <div className="modal" dir={dir()} style={{ width: 480, maxHeight: "85vh", overflowY: "auto" }} onClick={(e) => e.stopPropagation()}>
         <h3 style={{ marginTop: 0 }}>{t("chatSettings")}</h3>
 
         <label style={{ fontSize: 13, opacity: 0.8 }}>{t("language")}</label>
@@ -47,30 +62,6 @@ export default function SettingsModal({
           rows={5}
           dir="ltr"
           style={{ width: "100%", marginTop: 4, marginBottom: 12, fontFamily: "inherit", fontSize: 13 }}
-        />
-
-        <label style={{ fontSize: 13, opacity: 0.8 }}>Reasoning effort</label>
-        <select
-          value={local.reasoningEffort}
-          onChange={(e) => setLocal({ ...local, reasoningEffort: e.target.value as ReasoningEffort })}
-          style={{ display: "block", marginTop: 4, marginBottom: 12, width: "100%" }}
-        >
-          <option value="high">high</option>
-          <option value="xhigh">xhigh</option>
-          <option value="max">max</option>
-        </select>
-
-        <label style={{ fontSize: 13, opacity: 0.8 }}>
-          Temperature: {local.temperature.toFixed(1)}
-        </label>
-        <input
-          type="range"
-          min={0}
-          max={2}
-          step={0.1}
-          value={local.temperature}
-          onChange={(e) => setLocal({ ...local, temperature: parseFloat(e.target.value) })}
-          style={{ width: "100%", marginTop: 4, marginBottom: 12 }}
         />
 
         <label style={{ fontSize: 13, opacity: 0.8 }}>{t("ctxBudget")}</label>
@@ -96,12 +87,32 @@ export default function SettingsModal({
           {t("autoApprove")}
         </label>
 
-        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+        <label style={{ display: "flex", alignItems: "flex-start", gap: 8, fontSize: 13, marginBottom: 16 }}>
+          <input
+            type="checkbox"
+            checked={localLowPower}
+            onChange={(e) => setLocalLowPower(e.target.checked)}
+          />
+          <span>
+            <span style={{ display: "block" }}>{t("lowPowerMode")}</span>
+            <span style={{ display: "block", fontSize: 11, opacity: 0.55, marginTop: 2 }}>{t("lowPowerModeHelp")}</span>
+          </span>
+        </label>
+
+        <WindowVisionSettings />
+
+        <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", alignItems: "center" }}>
+          {appVersion && (
+            <span style={{ fontSize: 11, opacity: 0.5, marginInlineEnd: "auto" }} dir="ltr">
+              MAHI v{appVersion}
+            </span>
+          )}
           <button onClick={onClose}>{t("cancel")}</button>
           <button
             className="primary"
             onClick={() => {
               onSave(local);
+              onLowPowerModeChange(localLowPower);
               onClose();
             }}
           >

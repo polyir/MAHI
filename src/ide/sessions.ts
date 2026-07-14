@@ -1,10 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Msg, Usage, ReasoningEffort, sanitizeEffort } from "../agent";
+import { Msg, Usage } from "../agent";
 import { t } from "./i18n";
 
 export const DEFAULT_SYSTEM_PROMPT = `You are an autonomous coding agent embedded in the MAHI IDE, working on the user's real project. Be capable, careful, honest, and token-frugal — every tool call and every word costs the user real money.
 
-## Workflow
+## Operating rules
 1. Pick the most reasonable interpretation of ambiguous requests and state your assumption in one line; don't stall on questions unless the action is destructive.
 2. Explore before editing: glob_files (find by name), search_files (find by content), read_file. Never edit a file you haven't read this conversation. For non-trivial tasks, list a short plan first.
 3. BATCH your tool calls: every round-trip re-bills the whole conversation, so emit ALL independent tool calls of a step together in ONE response — read every file you need at once, apply edits to different files together. Only sequence calls when one truly depends on another's result.
@@ -27,8 +27,15 @@ export type Session = {
   usage: Usage;
   createdAt: number;
   systemPrompt: string;
-  reasoningEffort: ReasoningEffort;
+  // Raw user-selected value; only meaningful for the currently selected
+  // provider+model (see reasoningEffortOptions in agent.ts) — a stale value
+  // left over from a different model is simply ignored and re-defaulted by
+  // the caller, not migrated or validated here.
+  reasoningEffort?: string;
   temperature: number;
+  // Temperature is opt-in via a checkbox above the chat box; unchecked means
+  // the field isn't sent to the API at all rather than sent as some default.
+  temperatureEnabled: boolean;
   autoApprove: boolean;
   // Prompt-history budget (estimated tokens). Default stays under Sakana's
   // 272k price cliff, where input pricing doubles.
@@ -50,7 +57,10 @@ export const ACTIVE_KEY = "vibe_active_session_v2";
 function normalizeSessions(parsed: Session[]): Session[] {
   return parsed.map((s) => ({
     ...s,
-    reasoningEffort: sanitizeEffort(s.reasoningEffort),
+    // Older sessions predate this checkbox — default to true so temperature
+    // keeps being sent exactly as it always was, with no silent behavior
+    // change for existing chats.
+    temperatureEnabled: (s as any).temperatureEnabled ?? true,
     contextBudget: s.contextBudget || 200_000,
     // Sessions created before projects existed all belonged to the one
     // implicit project (see projects.ts's back-compat "default" seed).
@@ -119,8 +129,8 @@ export function newSession(projectId: string): Session {
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     createdAt: Date.now(),
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
-    reasoningEffort: "high",
     temperature: 0.7,
+    temperatureEnabled: true,
     autoApprove: false,
     contextBudget: 200_000,
     projectId,

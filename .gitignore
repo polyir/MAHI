@@ -37,3 +37,21 @@ MAHI icon.png
 
 # Test audio generated while developing the ElevenLabs TTS integration
 .mahi-speech/
+
+# Local version-history log Claude maintains for its own version-numbering
+# decisions — not meant to be part of the repo's shared history
+VERSION_LOG.md
+
+# Local-only infrastructure credentials (server logins etc) — never commit
+PROJECT_CREDENTIALS.md
+
+# Updater signing private key — never commit (the .pub counterpart is fine,
+# it's referenced from tauri.conf.json)
+src-tauri/mahi-updater.key
+.mahi/
+
+# Downloaded studio MCP servers (see src-tauri/src/mcp_servers.rs). Real
+# users get this at ~/Documents/MAHI/.mcp-servers, which only collides with
+# this repo's own working tree on a dev machine that happens to have MAHI
+# checked out at that exact path.
+.mcp-servers/

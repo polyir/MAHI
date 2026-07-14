@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Plus,
@@ -17,13 +18,22 @@ import {
   Mic,
   Wand2,
   FlaskConical,
+  Check,
+  X,
+  Network,
+  SlidersHorizontal,
+  Puzzle,
+  Library,
 } from "lucide-react";
 import {
   agentTurn,
   makeClient,
+  providerComplete,
   Msg,
   Usage,
-  sanitizeEffort,
+  defaultReasoningEffort,
+  reasoningEffortOptions,
+  reasoningEffortChoices,
   sanitizeHistory,
   compactHistory,
   BrowserControl,
@@ -32,7 +42,7 @@ import {
 } from "../agent";
 import { isElevenLabsAsrEnabled, loadActiveAsrModel } from "./models";
 import { transcribeElevenLabs } from "./elevenlabs";
-import { GRAPHIFY_SYSTEM_NOTE, isGraphifyAvailable } from "./externalTools";
+import { FILE_DRAG_MIME, readFileDragData } from "./fileOps";
 import FishLoader from "./FishLoader";
 import { recordUsage } from "./limits";
 import { notifyTaskDone } from "./completion";
@@ -40,12 +50,15 @@ import Message from "../components/Message";
 import ApprovalModal, { PendingApproval } from "../components/ApprovalModal";
 import SettingsModal, { SessionSettings } from "../components/SettingsModal";
 import PromptLabModal from "./PromptLabModal";
+import ProjectSettingsModal from "./ProjectSettingsModal";
+import VoiceWaveform from "./VoiceWaveform";
 import type { Session } from "./sessions";
 import { loadSessions, loadSessionsFromFile, saveSessionsToFile, newSession, SESSIONS_KEY, ACTIVE_KEY } from "./sessions";
 import type { Project } from "./projects";
 import { loadProjects, saveProjects, loadActiveProjectId, saveActiveProjectId, newProject } from "./projects";
 import type { Provider } from "./providers";
 import { LOCAL_PROVIDER_ID } from "./providers";
+import { listMcpTools, type McpServer } from "./mcp";
 import {
   loadLocalCtxOverride,
   localPromptBudget,
@@ -65,8 +78,16 @@ import {
   summarizeHistory,
 } from "./localLlm";
 import { t, useLang, dir as uiDir, getLang } from "./i18n";
+import LibraryModal from "./LibraryModal";
+import { activeLibraryItems, enabledLibraryCount, LibraryItem, libraryDisplayName, libraryPrompt, listLibrary, loadLibraryImages } from "./library";
 
 const MAX_ATTACH_CHARS = 8000;
+const KEEP_SKILLS_KEY = "mahi_keep_selected_skills_";
+
+function loadKeepSelectedSkills(projectId: string): boolean {
+  return projectId ? localStorage.getItem(`${KEEP_SKILLS_KEY}${projectId}`) === "1" : false;
+}
+
 const TURN_MUTATION_TOOLS = new Set([
   "write_file",
   "edit_file",
@@ -74,6 +95,8 @@ const TURN_MUTATION_TOOLS = new Set([
   "move_file",
   "generate_image",
   "generate_audio",
+  "generate_music",
+  "generate_sound_effect",
   "speak_text",
 ]);
 const TREE_MUTATION_TOOLS = new Set([
@@ -82,12 +105,16 @@ const TREE_MUTATION_TOOLS = new Set([
   "move_file",
   "generate_image",
   "generate_audio",
+  "generate_music",
+  "generate_sound_effect",
   "speak_text",
 ]);
 
 export default function ChatPanel({
   provider,
   providers,
+  mcpServers,
+  onMcpServersChange,
   model,
   workspace,
   onFileChanged,
@@ -99,9 +126,13 @@ export default function ChatPanel({
   activeTabPath,
   onOpenFileForAgent,
   onOpenModels,
+  lowPowerMode,
+  onLowPowerModeChange,
 }: {
   provider: Provider;
   providers: Provider[];
+  mcpServers: McpServer[];
+  onMcpServersChange: (s: McpServer[]) => void;
   model: string;
   workspace: string;
   onFileChanged: (relPath: string) => void;
@@ -118,11 +149,29 @@ export default function ChatPanel({
   // Opens Settings → Local AI Models — used when the user picks the local
   // provider/model but hasn't downloaded it yet.
   onOpenModels: () => void;
+  lowPowerMode: boolean;
+  onLowPowerModeChange: (enabled: boolean) => void;
 }) {
   useLang();
   const [projects, setProjects] = useState<Project[]>(loadProjects);
   const [activeProjectId, setActiveProjectId] = useState<string>(loadActiveProjectId);
   const activeProject = projects.find((p) => p.id === activeProjectId) ?? projects[0];
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [skills, setSkills] = useState<LibraryItem[]>([]);
+  const activeSkillItems = activeProject ? activeLibraryItems(skills, activeProject.id) : [];
+  const [selectedSkillIds, setSelectedSkillIds] = useState<Set<string>>(new Set());
+  const [keepSelectedSkills, setKeepSelectedSkills] = useState(() => loadKeepSelectedSkills(loadActiveProjectId()));
+  const [showSkillPicker, setShowSkillPicker] = useState(false);
+  const selectedSkillItems = activeSkillItems.filter((skill) => selectedSkillIds.has(skill.id));
+
+  useEffect(() => {
+    listLibrary().then(setSkills).catch(() => setSkills([]));
+  }, []);
+  useEffect(() => {
+    setSelectedSkillIds(new Set());
+    setKeepSelectedSkills(loadKeepSelectedSkills(activeProject?.id ?? activeProjectId));
+    setShowSkillPicker(false);
+  }, [activeProjectId, activeProject?.id]);
   // The directory this chat's tool calls operate on — independent of
   // `workspace` (the IDE's own open-folder), which is only used below to
   // decide whether an agent file-change should also refresh the IDE tree.
@@ -153,17 +202,90 @@ export default function ChatPanel({
   const [showSettings, setShowSettings] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [showPromptLab, setShowPromptLab] = useState(false);
+  const [showProjectSettings, setShowProjectSettings] = useState(false);
+  // Groups the model-routing switch and per-server MCP toggles into one
+  // popover instead of a growing row of individual icons — same reasoning
+  // as consolidating provider settings vs project settings: one clear entry
+  // point for "what extra capabilities does this message have" rather than
+  // one icon per capability.
+  const [showCapabilities, setShowCapabilities] = useState(false);
+  const [mcpHealth, setMcpHealth] = useState<
+    Record<string, { state: "checking" | "connected" | "error"; toolCount?: number; error?: string }>
+  >({});
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [pickedElement, setPickedElement] = useState<{ tag: string; text: string; selector: string } | null>(null);
+  const [elementComment, setElementComment] = useState("");
+  // Screenshot of the picked element, cropped from an OS-level window
+  // capture (see browser_capture_element_screenshot) and downscaled through
+  // the same fileToCompressedDataUrl pipeline as pasted images. Kept
+  // separate from pastedImages until confirm, so the user can drop just the
+  // screenshot (some models/endpoints don't accept image input) while
+  // keeping the text reference.
+  const [pickedScreenshot, setPickedScreenshot] = useState<string | null>(null);
+  const [screenshotCapturing, setScreenshotCapturing] = useState(false);
   const [pastedImages, setPastedImages] = useState<string[]>([]);
+  // Per-session switch for the call_model tool (cross-model delegation) —
+  // see agent.ts's buildCallModelTool/runCallModelTool. Re-initialized from
+  // the active project's permanently-trusted flag whenever the project
+  // changes (below), but can still be toggled independently within a
+  // session without touching that persisted flag.
+  const [allowModelRouting, setAllowModelRouting] = useState(false);
+  const [showRoutingConfirm, setShowRoutingConfirm] = useState(false);
+  const [routingConfirmKeep, setRoutingConfirmKeep] = useState(false);
+  useEffect(() => {
+    if (!showCapabilities) return;
+    let active = true;
+    const enabled = mcpServers.filter((server) => server.enabled);
+    setMcpHealth(
+      Object.fromEntries(enabled.map((server) => [server.id, { state: "checking" as const }]))
+    );
+    void Promise.all(
+      enabled.map(async (server) => {
+        try {
+          const tools = await listMcpTools(server);
+          if (!active) return;
+          setMcpHealth((current) => ({
+            ...current,
+            [server.id]: { state: "connected", toolCount: tools.length },
+          }));
+        } catch (error) {
+          if (!active) return;
+          setMcpHealth((current) => ({
+            ...current,
+            [server.id]: { state: "error", error: String(error) },
+          }));
+        }
+      })
+    );
+    return () => {
+      active = false;
+    };
+  }, [showCapabilities, mcpServers]);
+  // Sending while the switch is on but the project isn't yet trusted asks
+  // once via the popup; this ref remembers "already confirmed this
+  // session" without the stale-closure risk a state variable would have
+  // right after the popup's own confirm handler flips it (see send()).
+  const routingConfirmedRef = useRef(false);
+  const [fileDragOver, setFileDragOver] = useState(false);
   const [recording, setRecording] = useState(false);
   const [micConnecting, setMicConnecting] = useState(false);
   const [transcribingMic, setTranscribingMic] = useState(false);
+  const micRecordingPathRef = useRef<string | null>(null);
+  useEffect(() => {
+    return () => {
+      const path = micRecordingPathRef.current;
+      if (path) {
+        micRecordingPathRef.current = null;
+        invoke("microphone_stop")
+          .catch(() => {})
+          .finally(() => invoke("delete_file", { workspace: projectDir, path }).catch(() => {}));
+      }
+    };
+  }, [projectDir]);
   const [improving, setImproving] = useState(false);
   const [preparingAttachment, setPreparingAttachment] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>([]);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const recordedChunksRef = useRef<Blob[]>([]);
   const [mentionOpen, setMentionOpen] = useState(false);
   const [mentionQuery, setMentionQuery] = useState("");
   const [projectFiles, setProjectFiles] = useState<string[]>([]);
@@ -222,6 +344,36 @@ export default function ChatPanel({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+  // Fired by the browser tab's "inspect element" mode (see browser.rs) —
+  // global rather than scoped to a specific tab/project, since only one
+  // ChatPanel is ever mounted at a time in this single-pane layout.
+  useEffect(() => {
+    const unlisten = listen<{
+      tabId: string;
+      tag: string;
+      text: string;
+      selector: string;
+      rectX: number;
+      rectY: number;
+      rectW: number;
+      rectH: number;
+    }>("browser-element-picked", (e) => {
+      setPickedElement({ tag: e.payload.tag, text: e.payload.text, selector: e.payload.selector });
+      setElementComment("");
+      setPickedScreenshot(null);
+      setScreenshotCapturing(true);
+      captureElementScreenshot(e.payload.tabId, {
+        x: e.payload.rectX,
+        y: e.payload.rectY,
+        w: e.payload.rectW,
+        h: e.payload.rectH,
+      });
+    });
+    return () => {
+      unlisten.then((un) => un());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // One-time migration off localStorage (see sessions.ts) — on the first
   // launch after upgrading, the file doesn't exist yet, so `sessions` stays
   // whatever the synchronous localStorage-based initializer above produced.
@@ -260,6 +412,16 @@ export default function ChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProjectId]);
 
+  // Switching projects starts the routing switch from that project's own
+  // permanently-trusted flag, and forgets any "confirmed this session" state
+  // from whatever project was active before — a trust decision for one
+  // project must never silently carry over to another.
+  useEffect(() => {
+    setAllowModelRouting(!!activeProject?.allowModelRouting);
+    routingConfirmedRef.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProjectId]);
+
   // Restore the per-session draft on mount and whenever the session changes.
   useEffect(() => {
     setInputRaw(localStorage.getItem(`vibe_draft_${activeId}`) ?? "");
@@ -288,6 +450,17 @@ export default function ChatPanel({
   // actually in effect for the currently selected provider/model.
   const gaugeBudget =
     provider.id === LOCAL_PROVIDER_ID ? localPromptBudget(model) : active.contextBudget || 200_000;
+
+  // Reasoning effort's valid values depend on the selected provider+model
+  // (see reasoningEffortOptions in agent.ts) — a value picked for a
+  // different model is simply not in this list, so fall back to that
+  // model's own default instead of sending something invalid.
+  const effortOptions = reasoningEffortOptions(provider, model);
+  const effortChoices = reasoningEffortChoices(provider, model);
+  const effortValue =
+    active.reasoningEffort && effortOptions.includes(active.reasoningEffort)
+      ? active.reasoningEffort
+      : defaultReasoningEffort(provider, model);
 
   function pickProjectFolder() {
     open({ directory: true, multiple: false }).then((dir) => {
@@ -387,18 +560,10 @@ export default function ChatPanel({
   // local path, so behavior is consistent regardless of which the user picks.
   async function improveWithCloudProvider(p: Provider, model: string, draft: string, lang: string): Promise<string | null> {
     try {
-      const client = makeClient(p.apiKey, p.baseURL);
-      const resp = await client.chat.completions.create({
-        model: model || p.models[0],
-        messages: [
-          { role: "system", content: improvePromptSystem(lang) },
-          { role: "user", content: draft.slice(0, 4000) },
-        ],
-        max_tokens: 700,
-        temperature: 0.2,
-      });
-      const text = resp.choices[0]?.message?.content;
-      return text?.trim() || null;
+      return await providerComplete(p, model || p.models[0], [
+        { role: "system", content: improvePromptSystem(lang) },
+        { role: "user", content: draft.slice(0, 4000) },
+      ], { maxTokens: 700, temperature: 0.2 });
     } catch {
       return null;
     }
@@ -410,18 +575,10 @@ export default function ChatPanel({
   async function cleanDictationWithCloudProvider(p: Provider, model: string, text: string, lang: string): Promise<string | null> {
     if (text.length > 2000) return null;
     try {
-      const client = makeClient(p.apiKey, p.baseURL);
-      const resp = await client.chat.completions.create({
-        model: model || p.models[0],
-        messages: [
-          { role: "system", content: dictationCleanupSystem(lang) },
-          { role: "user", content: text },
-        ],
-        max_tokens: Math.max(200, Math.round(text.length * 1.3)),
-        temperature: 0.2,
-      });
-      const reply = resp.choices[0]?.message?.content;
-      return reply?.trim() || null;
+      return await providerComplete(p, model || p.models[0], [
+        { role: "system", content: dictationCleanupSystem(lang) },
+        { role: "user", content: text },
+      ], { maxTokens: Math.max(200, Math.round(text.length * 1.3)), temperature: 0.2 });
     } catch {
       return null;
     }
@@ -492,10 +649,17 @@ export default function ChatPanel({
   }
 
   const mentionMatches = useMemo(() => {
-    if (!mentionQuery) return projectFiles.slice(0, 8);
     const q = mentionQuery.toLowerCase();
-    return projectFiles.filter((f) => f.toLowerCase().includes(q)).slice(0, 8);
-  }, [mentionQuery, projectFiles]);
+    const projectMatches = projectFiles.map((path) => ({ key: `project:${path}`, label: path, projectPath: path }));
+    const skillMatches = activeSkillItems.flatMap((skill) => {
+      const skillName = libraryDisplayName(skill);
+      return [
+        { key: `skill:${skill.id}`, label: `Skill: ${skillName}`, reference: `@skill:${skillName}`, skillId: skill.id },
+        ...skill.files.map((file) => ({ key: `skill:${skill.id}:${file.name}`, label: `${skillName}/${file.name}`, reference: `@skill:${skillName}/${file.name}`, skillId: skill.id })),
+      ];
+    });
+    return [...skillMatches, ...projectMatches].filter((item) => !q || item.label.toLowerCase().includes(q)).slice(0, 8);
+  }, [mentionQuery, projectFiles, activeSkillItems]);
 
   function onInputChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
     const v = e.target.value;
@@ -503,7 +667,7 @@ export default function ChatPanel({
     // open mention dropdown while typing @word
     const caret = e.target.selectionStart ?? v.length;
     const before = v.slice(0, caret);
-    const m = before.match(/@([\w./-]*)$/);
+    const m = before.match(/@([^\s@]*)$/);
     if (m) {
       setMentionOpen(true);
       setMentionQuery(m[1]);
@@ -512,12 +676,51 @@ export default function ChatPanel({
     }
   }
 
-  function pickMention(path: string) {
-    // remove the trailing @query from input and attach the file instead
-    setInput((cur) => cur.replace(/@([\w./-]*)$/, ""));
-    setAttachments((cur) => (cur.includes(path) ? cur : [...cur, path]));
+  function pickMention(item: { projectPath?: string; reference?: string; skillId?: string }) {
+    setInput((cur) => cur.replace(/@([^\s@]*)$/, item.reference ? `${item.reference} ` : ""));
+    if (item.projectPath) setAttachments((cur) => (cur.includes(item.projectPath!) ? cur : [...cur, item.projectPath!]));
+    if (item.skillId) setSelectedSkillIds((current) => new Set(current).add(item.skillId!));
     setMentionOpen(false);
     inputRef.current?.focus();
+  }
+
+  function confirmElementComment() {
+    if (!pickedElement) return;
+    const label = pickedElement.text ? `<${pickedElement.tag}> "${pickedElement.text}"` : `<${pickedElement.tag}>`;
+    const ref = `[${t("inspectElementRefLabel")}: ${label} — selector: ${pickedElement.selector}]`;
+    const note = elementComment.trim();
+    const line = note ? `${ref} ${note}` : ref;
+    setInput((cur) => (cur.trim() ? `${cur}\n${line}` : line));
+    if (pickedScreenshot) setPastedImages((cur) => [...cur, pickedScreenshot]);
+    setPickedElement(null);
+    setElementComment("");
+    setPickedScreenshot(null);
+    inputRef.current?.focus();
+  }
+
+  function cancelElementPick() {
+    setPickedElement(null);
+    setElementComment("");
+    setPickedScreenshot(null);
+  }
+
+  // Dropped from the file tree, which is always rooted at `workspace` — only
+  // meaningful to attach when this chat's active project is that same folder
+  // (attachments are read via `read_file` against `projectDir`).
+  function onFileTreeDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setFileDragOver(false);
+    const payload = readFileDragData(e);
+    if (!payload) return;
+    if (payload.workspace !== projectDir) {
+      toast(t("droppedWrongProject"), "err");
+      return;
+    }
+    if (payload.isDir) {
+      toast(t("cannotAttachFolder"), "err");
+      return;
+    }
+    setAttachments((cur) => (cur.includes(payload.relPath) ? cur : [...cur, payload.relPath]));
   }
 
   function stop() {
@@ -546,6 +749,36 @@ export default function ChatPanel({
     return canvas.toDataURL("image/jpeg", quality);
   }
 
+  // Crops a screenshot of just the picked element (see
+  // browser_capture_element_screenshot in browser.rs — an OS-level window
+  // capture, not a <canvas> read, so it works for cross-origin content and
+  // iframes too). The element's rect comes from the page's own
+  // getBoundingClientRect() (CSS px); browser.rs expects physical pixels to
+  // match wv.position(), so it's scaled by devicePixelRatio here first, same
+  // convention BrowserTabView.tsx already uses for positioning the webview.
+  async function captureElementScreenshot(
+    tabId: string,
+    rect: { x: number; y: number; w: number; h: number }
+  ) {
+    const dpr = window.devicePixelRatio || 1;
+    try {
+      const base64 = await invoke<string>("browser_capture_element_screenshot", {
+        tabId,
+        rectX: rect.x * dpr,
+        rectY: rect.y * dpr,
+        rectW: rect.w * dpr,
+        rectH: rect.h * dpr,
+      });
+      const blob = await (await fetch(`data:image/png;base64,${base64}`)).blob();
+      const compressed = await fileToCompressedDataUrl(new File([blob], "element.png", { type: "image/png" }));
+      setPickedScreenshot(compressed);
+    } catch {
+      setPickedScreenshot(null);
+    } finally {
+      setScreenshotCapturing(false);
+    }
+  }
+
   async function onPasteInput(e: React.ClipboardEvent<HTMLTextAreaElement>) {
     const items = Array.from(e.clipboardData.items).filter((it) => it.type.startsWith("image/"));
     if (!items.length) return; // let normal text paste proceed
@@ -562,33 +795,18 @@ export default function ChatPanel({
     }
   }
 
-  // Voice input: record with MediaRecorder, hand the clip to the same
-  // transcribe_media/Whisper pipeline the "Transcribe" button uses (a real
-  // file on disk, not a new code path), then append the transcript to
-  // whatever's already typed rather than replacing it.
+  // Voice input is recorded natively because WKWebView's custom tauri://
+  // origin doesn't expose navigator.mediaDevices on macOS.
   async function startRecording() {
-    if (!loadActiveAsrModel()) {
+    if (!isElevenLabsAsrEnabled() && !loadActiveAsrModel()) {
       toast(t("noAsrModel"), "err");
       return;
     }
-    // Feedback the instant the button is pressed — getUserMedia (and the
-    // OS's own mic-activation indicator) can take a visible moment, and
-    // without this the button looked unresponsive for that whole gap.
     setMicConnecting(true);
+    const recPath = `.mahi-mic/${Date.now()}.m4a`;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mimeType = ["audio/mp4", "audio/webm", "audio/wav"].find((m) => MediaRecorder.isTypeSupported(m));
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      recordedChunksRef.current = [];
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
-      };
-      recorder.onstop = () => {
-        stream.getTracks().forEach((tr) => tr.stop());
-        void finishRecording(recorder.mimeType || mimeType || "audio/webm");
-      };
-      mediaRecorderRef.current = recorder;
-      recorder.start();
+      await invoke("microphone_start", { workspace: projectDir, path: recPath });
+      micRecordingPathRef.current = recPath;
       setMicConnecting(false);
       setRecording(true);
     } catch (e) {
@@ -597,24 +815,23 @@ export default function ChatPanel({
     }
   }
 
-  function stopRecording() {
-    mediaRecorderRef.current?.stop();
+  async function stopRecording() {
+    const recPath = micRecordingPathRef.current;
+    micRecordingPathRef.current = null;
     setRecording(false);
+    if (!recPath) return;
+    try {
+      await invoke("microphone_stop");
+      await finishRecording(recPath);
+    } catch (e) {
+      toast(`${t("micError")}: ${String(e)}`, "err");
+      invoke("delete_file", { workspace: projectDir, path: recPath }).catch(() => {});
+    }
   }
 
-  async function finishRecording(mimeType: string) {
-    const blob = new Blob(recordedChunksRef.current, { type: mimeType });
-    recordedChunksRef.current = [];
-    if (blob.size === 0) return;
+  async function finishRecording(recPath: string) {
     setTranscribingMic(true);
-    const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("wav") ? "wav" : "m4a";
-    const recPath = `.mahi-mic/${Date.now()}.${ext}`;
     try {
-      const buf = new Uint8Array(await blob.arrayBuffer());
-      let binary = "";
-      for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]);
-      const base64Content = btoa(binary);
-      await invoke("write_file_binary", { workspace: projectDir, path: recPath, base64Content });
       // Opt-in (Settings → Local AI Models): routes dictation through
       // ElevenLabs's cloud speech-to-text instead of the local Whisper
       // model. Falls back to local Whisper on any failure (bad/missing API
@@ -623,6 +840,10 @@ export default function ChatPanel({
       const result = isElevenLabsAsrEnabled()
         ? await (async () => {
             try {
+              const base64Audio = await invoke<string>("microphone_read", { workspace: projectDir, path: recPath });
+              const binary = atob(base64Audio);
+              const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+              const blob = new Blob([bytes], { type: "audio/mp4" });
               const r = await transcribeElevenLabs(blob);
               return { text: r.text, detected_language: r.languageCode };
             } catch (e) {
@@ -673,7 +894,7 @@ export default function ChatPanel({
   }
 
   function toggleRecording() {
-    if (recording) stopRecording();
+    if (recording) void stopRecording();
     else void startRecording();
   }
 
@@ -681,8 +902,14 @@ export default function ChatPanel({
   // API call within a turn (these APIs are stateless), so keep it small and
   // reuse one fetch per workspace instead of re-fetching every send.
   const treeCache = useRef<{ workspace: string; maxEntries: number; tree: string } | null>(null);
-  async function buildSystemContent(): Promise<string> {
-    let systemContent = active.systemPrompt;
+  async function buildSystemContent(turnSkills: LibraryItem[] = []): Promise<string> {
+    let systemContent = activeProject?.instructions
+      ? `${activeProject.instructions}\n\n${active.systemPrompt}`
+      : active.systemPrompt;
+    if (activeProject) {
+      systemContent += libraryPrompt(turnSkills);
+      if (turnSkills.length) systemContent += `\nProject skill map: ${projectDir}/.mahi/skills.yaml`;
+    }
     try {
       // Local models have far smaller context windows than the cloud
       // providers this tree size was tuned for — a large workspace's tree
@@ -702,9 +929,6 @@ export default function ChatPanel({
     if (projectDir === workspace && openTabs.length) {
       systemContent += `\n\nCurrently open tabs in the IDE's editor/preview panel (the user can see these on screen): ${openTabs.join(", ")}`;
       if (activeTabPath) systemContent += `\nActive/focused tab: ${activeTabPath}`;
-    }
-    if (await isGraphifyAvailable()) {
-      systemContent += `\n\n${GRAPHIFY_SYSTEM_NOTE}`;
     }
     return systemContent;
   }
@@ -729,6 +953,9 @@ export default function ChatPanel({
     // suggestion-chips call below; works for both send() and continueTurn()
     // without either needing to pass it explicitly.
     const lastUserMsg = [...history].reverse().find((m) => m.role === "user");
+    const turnSkillRoots = activeSkillItems
+      .filter((skill) => lastUserMsg?.skillIds?.includes(skill.id))
+      .map((skill) => skill.bundleRoot);
 
     // The local provider has no real baseURL until the sidecar for this
     // specific model is actually running — resolve it fresh each turn
@@ -764,10 +991,8 @@ export default function ChatPanel({
 
     try {
       await agentTurn(clientRef.current, model, projectDir, history, {
-        // reasoning_effort is Sakana-specific; other providers may reject
-        // unknown params, so only send it there.
-        reasoningEffort: provider.id === "sakana" ? sanitizeEffort(active.reasoningEffort) : undefined,
-        temperature: active.temperature,
+        reasoningEffort: effortValue,
+        temperature: active.temperatureEnabled ? active.temperature : undefined,
         signal: controller.signal,
         checkpointId,
         contextBudget: gaugeBudget,
@@ -799,6 +1024,9 @@ export default function ChatPanel({
         requestApproval,
         chatProvider: provider,
         allProviders: providers,
+        mcpServers,
+        allowModelRouting,
+        skillRoots: turnSkillRoots,
         browserControl,
         onScreenshot,
         // Opening a tab only makes sense when this chat's project is the
@@ -812,7 +1040,13 @@ export default function ChatPanel({
         addMessage({ role: "assistant", content: t("stoppedMsg") });
       } else {
         hadError = true;
-        addMessage({ role: "assistant", content: `${t("disconnectedPrefix")}: ${String(e?.message ?? e)}` });
+        // Extract useful provider details for the visible error message without
+        // duplicating the full SDK error (which may contain request data) into
+        // the WebView console.
+        const errStatus = e?.status ?? e?.response?.status;
+        const errBody = e?.error ? JSON.stringify(e.error) : (e?.message ?? String(e));
+        const errDisplay = errStatus ? `${errStatus}: ${errBody}` : errBody;
+        addMessage({ role: "assistant", content: `${t("disconnectedPrefix")}: ${errDisplay}` });
         toast(t("disconnectToast"), "err");
       }
     } finally {
@@ -888,6 +1122,34 @@ export default function ChatPanel({
 
   async function send() {
     if (!input.trim() || busy) return;
+    // The switch being on isn't itself enough to send call_model to the
+    // model — unless this project is already permanently trusted (or this
+    // session already confirmed once), ask first. routingConfirmedRef (not
+    // state) avoids a stale-closure race: confirmRoutingAndSend below needs
+    // to proceed synchronously in the same tick it flips this, before any
+    // re-render would reflect a state update.
+    if (allowModelRouting && !activeProject?.allowModelRouting && !routingConfirmedRef.current) {
+      setShowRoutingConfirm(true);
+      return;
+    }
+    await doSend();
+  }
+
+  async function confirmRoutingAndSend() {
+    if (routingConfirmKeep) {
+      setProjects((cur) =>
+        cur.map((p) => (p.id === activeProjectId ? { ...p, allowModelRouting: true } : p))
+      );
+    } else {
+      routingConfirmedRef.current = true;
+    }
+    setShowRoutingConfirm(false);
+    setRoutingConfirmKeep(false);
+    await doSend();
+  }
+
+  async function doSend() {
+    if (!input.trim() || busy) return;
     if (!provider.apiKey) {
       toast(`${t("enterApiKeyFor")} ${provider.name}`, "err");
       return;
@@ -898,6 +1160,8 @@ export default function ChatPanel({
     }
 
     const firstUserText = input;
+    const turnSkillIds = [...selectedSkillIds];
+    const turnSkills = activeSkillItems.filter((skill) => selectedSkillIds.has(skill.id));
     // Build user message: attachments are inlined as context blocks.
     let userContent = input;
     for (const path of attachments) {
@@ -929,9 +1193,14 @@ export default function ChatPanel({
       content: userContent,
       checkpointId,
       images: pastedImages.length ? pastedImages : undefined,
+      skillIds: turnSkillIds.length ? turnSkillIds : undefined,
     };
     const isFirst = !active.messages.some((m) => m.role === "user");
-    const systemContent = await buildSystemContent();
+    const systemContent = await buildSystemContent(turnSkills);
+    const libraryImages = await loadLibraryImages(turnSkills).catch(() => []);
+    const wireUserMsg = libraryImages.length
+      ? { ...userMsg, images: [...(userMsg.images ?? []), ...libraryImages] }
+      : userMsg;
     // Older turns' tool dumps get compacted before sending — they'd otherwise
     // be re-billed on every internal call of this turn. outgoingHistory also
     // substitutes any local-model-generated summary for the messages it
@@ -939,7 +1208,7 @@ export default function ChatPanel({
     const history: Msg[] = sanitizeHistory([
       { role: "system", content: systemContent },
       ...outgoingHistory(active),
-      userMsg,
+      wireUserMsg,
     ]);
 
     setSessions((cur) =>
@@ -952,6 +1221,8 @@ export default function ChatPanel({
     setInput("");
     setAttachments([]);
     setPastedImages([]);
+    if (!keepSelectedSkills) setSelectedSkillIds(new Set());
+    setShowSkillPicker(false);
     await runTurn(history, checkpointId, { isFirstTurn: isFirst, firstUserText });
   }
 
@@ -968,7 +1239,10 @@ export default function ChatPanel({
       checkpointId = undefined;
     }
 
-    const systemContent = await buildSystemContent();
+    const lastSkillIds = [...active.messages].reverse().find((message) => message.role === "user")?.skillIds ?? [];
+    const turnSkills = activeSkillItems.filter((skill) => lastSkillIds.includes(skill.id));
+    const systemContent = await buildSystemContent(turnSkills);
+    const libraryImages = await loadLibraryImages(turnSkills).catch(() => []);
     // Drop trailing local status notes (⏹/⚠️) so the model doesn't see them
     // as its own words; then repair dangling tool calls.
     const cleaned = active.messages.filter(
@@ -983,11 +1257,13 @@ export default function ChatPanel({
       role: "user",
       content: "The previous work was interrupted (connection lost or stopped). Continue from where you left off and complete the task.",
       checkpointId,
+      skillIds: lastSkillIds.length ? lastSkillIds : undefined,
     };
+    const wireResumeMsg = libraryImages.length ? { ...resumeMsg, images: libraryImages } : resumeMsg;
     const history: Msg[] = sanitizeHistory([
       { role: "system", content: systemContent },
       ...outgoingHistory({ ...active, messages: cleaned }),
-      resumeMsg,
+      wireResumeMsg,
     ]);
 
     setSessions((cur) =>
@@ -1042,7 +1318,24 @@ export default function ChatPanel({
   }, [active.messages]);
 
   return (
-    <div className="chat" dir={uiDir()}>
+    <div
+      className={`chat${fileDragOver ? " drag-over" : ""}`}
+      dir={uiDir()}
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes(FILE_DRAG_MIME)) return;
+        e.preventDefault();
+      }}
+      onDragEnter={(e) => {
+        if (!e.dataTransfer.types.includes(FILE_DRAG_MIME)) return;
+        e.preventDefault();
+        setFileDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        if ((e.currentTarget as HTMLDivElement).contains(e.relatedTarget as Node)) return;
+        setFileDragOver(false);
+      }}
+      onDrop={onFileTreeDrop}
+    >
       <div
         style={{
           display: "flex",
@@ -1097,6 +1390,9 @@ export default function ChatPanel({
             <Trash2 size={13} />
           </button>
         )}
+        <button className="ghost" onClick={() => setShowProjectSettings(true)} title={t("projectSettingsTitle")}>
+          <SlidersHorizontal size={13} />
+        </button>
       </div>
 
       {showHistory && (
@@ -1148,7 +1444,11 @@ export default function ChatPanel({
         )}
         {active.messages.map((m, i) => (
           <div key={i}>
-            <Message msg={m} workspace={projectDir} getScreenshot={getScreenshot} />
+            <Message
+              msg={m}
+              workspace={projectDir}
+              getScreenshot={getScreenshot}
+            />
             {m.role === "user" && m.checkpointId !== undefined && turnHasMutations.has(m.checkpointId) && (
               <div style={{ textAlign: "start", marginTop: 4 }}>
                 <button className="revert-btn" onClick={() => revertTo(m.checkpointId!)}>
@@ -1159,7 +1459,7 @@ export default function ChatPanel({
           </div>
         ))}
         {streamingText && (
-          <div className="typing">
+          <div>
             <Message msg={{ role: "assistant", content: streamingText }} workspace={projectDir} />
           </div>
         )}
@@ -1167,7 +1467,12 @@ export default function ChatPanel({
           <div
             style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 12, color: "var(--text-dim)", padding: "4px 4px" }}
           >
-            <FishLoader size={56} />
+            <div className="ripple-wrapper">
+              <div className="ripple-wave"></div>
+              <div className="ripple-wave"></div>
+              <div className="ripple-wave"></div>
+              <FishLoader size={56} />
+            </div>
             <span className="typing">
               {improving ? t("improving") : preparingAttachment ? t("summarizingAttachment") : notice || t("working")}
             </span>
@@ -1203,11 +1508,78 @@ export default function ChatPanel({
               boxShadow: "var(--shadow)",
             }}
           >
-            {mentionMatches.map((f) => (
-              <div key={f} className="tree-node" dir="ltr" onClick={() => pickMention(f)}>
-                {f}
+            {mentionMatches.map((item) => (
+              <div key={item.key} className="tree-node" dir="auto" onClick={() => pickMention(item)}>
+                {item.label}
               </div>
             ))}
+          </div>
+        )}
+
+        {pickedElement && (
+          <div
+            dir="auto"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 6,
+              padding: 8,
+              marginBottom: 7,
+              border: "1px solid var(--border-soft)",
+              borderRadius: 8,
+              background: "var(--bg-2)",
+            }}
+          >
+            <div style={{ fontSize: 11.5, opacity: 0.7 }} dir="ltr">
+              {pickedElement.text ? `<${pickedElement.tag}> "${pickedElement.text}"` : `<${pickedElement.tag}>`}
+            </div>
+            {(screenshotCapturing || pickedScreenshot) && (
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                {screenshotCapturing && (
+                  <span style={{ fontSize: 11, opacity: 0.6 }}>{t("inspectElementCapturing")}</span>
+                )}
+                {pickedScreenshot && (
+                  <>
+                    <img
+                      src={pickedScreenshot}
+                      alt=""
+                      style={{
+                        height: 22,
+                        width: 22,
+                        objectFit: "cover",
+                        borderRadius: 4,
+                        border: "1px solid var(--border-soft)",
+                        flexShrink: 0,
+                      }}
+                    />
+                    <button className="ghost" style={{ fontSize: 11 }} onClick={() => setPickedScreenshot(null)}>
+                      <X size={11} /> {t("inspectElementRemoveScreenshot")}
+                    </button>
+                    <span style={{ fontSize: 10.5, opacity: 0.55 }}>{t("inspectElementVisionHint")}</span>
+                  </>
+                )}
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 6 }}>
+              <input
+                autoFocus
+                dir="auto"
+                style={{ flex: 1 }}
+                value={elementComment}
+                onChange={(e) => setElementComment(e.target.value)}
+                placeholder={t("inspectElementCommentPlaceholder")}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") confirmElementComment();
+                  if (e.key === "Escape") cancelElementPick();
+                }}
+              />
+              <button className="ghost" onClick={confirmElementComment}>
+                <Check size={13} />
+              </button>
+              <button className="ghost" onClick={cancelElementPick}>
+                <X size={13} />
+              </button>
+            </div>
           </div>
         )}
 
@@ -1251,6 +1623,42 @@ export default function ChatPanel({
           </div>
         )}
 
+        <div style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", marginBottom: 4 }}>
+          {effortOptions.length > 0 && (
+            <select
+              value={effortValue}
+              onChange={(e) => updateActive({ reasoningEffort: e.target.value })}
+              title={t("reasoningEffortTitle")}
+              style={{ fontSize: 10.5, padding: "0 2px", flexShrink: 0, height: 18 }}
+            >
+              {effortChoices.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          )}
+          <input
+            type="checkbox"
+            checked={active.temperatureEnabled}
+            onChange={(e) => updateActive({ temperatureEnabled: e.target.checked })}
+            title={t("temperature")}
+            style={{ flexShrink: 0 }}
+          />
+          <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{t("tempPrecise")}</span>
+          <input
+            className="temperature-slider"
+            type="range"
+            min={0}
+            max={2}
+            step={0.1}
+            value={active.temperature}
+            disabled={!active.temperatureEnabled}
+            onChange={(e) => updateActive({ temperature: parseFloat(e.target.value) })}
+            style={{ flex: 1, opacity: active.temperatureEnabled ? 1 : 0.4 }}
+          />
+          <span style={{ fontSize: 10, color: "var(--text-faint)", flexShrink: 0 }}>{t("tempCreative")}</span>
+        </div>
         <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
           <button
             className="ghost"
@@ -1275,20 +1683,168 @@ export default function ChatPanel({
           >
             <Wand2 size={15} className={improving ? "typing" : undefined} />
           </button>
+          <button className="ghost library-trigger" title={t("skillsLibrary")} onClick={() => setLibraryOpen(true)} style={{ color: activeProject && enabledLibraryCount(skills, activeProject.id) ? "var(--accent)" : undefined }}>
+            <Library size={15} />
+            {activeProject && enabledLibraryCount(skills, activeProject.id) > 0 && <span className="count">{enabledLibraryCount(skills, activeProject.id)}</span>}
+          </button>
+          <div style={{ position: "relative" }}>
+            <button
+              className="ghost"
+              onClick={() => setShowCapabilities((v) => !v)}
+              title={t("capabilitiesTitle")}
+              style={{ color: allowModelRouting || mcpServers.some((s) => s.enabled) ? "var(--accent)" : undefined }}
+            >
+              <Puzzle size={15} />
+            </button>
+            {showCapabilities && (
+              <div
+                dir="auto"
+                style={{
+                  position: "absolute",
+                  bottom: "calc(100% + 6px)",
+                  insetInlineStart: 0,
+                  width: 260,
+                  background: "var(--bg-1)",
+                  border: "1px solid var(--border-soft)",
+                  borderRadius: 10,
+                  padding: 10,
+                  boxShadow: "0 4px 16px rgba(0,0,0,0.3)",
+                  zIndex: 20,
+                  maxHeight: "min(420px, 65vh)",
+                  overflowY: "auto",
+                }}
+              >
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: mcpServers.length ? 10 : 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={allowModelRouting}
+                    onChange={(e) => setAllowModelRouting(e.target.checked)}
+                  />
+                  <Network size={13} />
+                  {t("allowModelRoutingTitle")}
+                </label>
+                {mcpServers.length > 0 && (
+                  <>
+                    <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 6 }}>{t("mcpServersTitle")}</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                      {mcpServers.map((s) => (
+                        <label
+                          key={s.id}
+                          title={mcpHealth[s.id]?.error}
+                          style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={s.enabled}
+                            onChange={(e) =>
+                              onMcpServersChange(
+                                mcpServers.map((x) => (x.id === s.id ? { ...x, enabled: e.target.checked } : x))
+                              )
+                            }
+                          />
+                          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {s.name}
+                          </span>
+                          {s.enabled && mcpHealth[s.id]?.state === "checking" && (
+                            <RotateCw size={11} className="typing" aria-label={t("mcpChecking")} />
+                          )}
+                          {s.enabled && mcpHealth[s.id]?.state === "connected" && (
+                            <span title={t("mcpConnected")} style={{ color: "#22c55e", fontSize: 10 }}>
+                              ● {mcpHealth[s.id].toolCount}
+                            </span>
+                          )}
+                          {s.enabled && mcpHealth[s.id]?.state === "error" && (
+                            <span title={mcpHealth[s.id].error ?? t("mcpUnavailable")} style={{ color: "var(--red)", fontSize: 10 }}>
+                              ●
+                            </span>
+                          )}
+                        </label>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          {activeSkillItems.length > 0 && (
+            <div className="active-library-summary" style={{ position: "relative" }}>
+              <label className={`skill-persist-toggle${keepSelectedSkills ? " enabled" : ""}`} title={keepSelectedSkills ? t("keepSkillsEnabled") : t("keepSkillsDisabled")}>
+                <input
+                  type="checkbox"
+                  checked={keepSelectedSkills}
+                  onChange={(event) => {
+                    const next = event.target.checked;
+                    setKeepSelectedSkills(next);
+                    localStorage.setItem(`${KEEP_SKILLS_KEY}${activeProject?.id ?? activeProjectId}`, next ? "1" : "0");
+                  }}
+                />
+                <span />
+              </label>
+              <button
+                className={`active-library-pill${selectedSkillItems.length ? " selected" : ""}`}
+                onClick={() => setShowSkillPicker((value) => !value)}
+                title={activeSkillItems.map(libraryDisplayName).join("\n")}
+              >
+                {selectedSkillItems.length}/{activeSkillItems.length} {t("activeSkills")}
+              </button>
+              {showSkillPicker && (
+                <div className="skill-quick-picker">
+                  <div className="skill-quick-picker-title">
+                    <span>{t("activeSkills")}</span>
+                    <button className="ghost" onClick={() => setSelectedSkillIds(new Set())}>{t("clear")}</button>
+                  </div>
+                  {activeSkillItems.map((skill) => (
+                    <label key={skill.id} title={skill.bundleRoot}>
+                      <input
+                        type="checkbox"
+                        checked={selectedSkillIds.has(skill.id)}
+                        onChange={(event) => setSelectedSkillIds((current) => {
+                          const next = new Set(current);
+                          event.target.checked ? next.add(skill.id) : next.delete(skill.id);
+                          return next;
+                        })}
+                      />
+                      <span>{libraryDisplayName(skill)}</span>
+                    </label>
+                  ))}
+                  <button className="ghost skill-picker-manage" onClick={() => { setShowSkillPicker(false); setLibraryOpen(true); }}>
+                    <Settings2 size={12} /> {t("skillsLibrary")}
+                  </button>
+                  <small>{keepSelectedSkills ? t("keepSkillsEnabled") : t("keepSkillsDisabled")}</small>
+                </div>
+              )}
+            </div>
+          )}
         </div>
         <div style={{ display: "flex", gap: 6, alignItems: "flex-end" }}>
-          <textarea
-            ref={inputRef}
-            rows={3}
-            dir="auto"
-            value={input}
-            disabled={busy || improving || preparingAttachment}
-            onChange={onInputChange}
-            onKeyDown={onKeyDown}
-            onPaste={onPasteInput}
-            placeholder={projectDir ? t("inputPlaceholder") : t("noProjectHint")}
-            style={{ flex: 1, resize: "none" }}
-          />
+          {recording ? (
+            <div
+              style={{
+                flex: 1,
+                display: "flex",
+                alignItems: "center",
+                padding: "0 10px",
+                minHeight: 68,
+                border: "1px solid var(--border-soft)",
+                borderRadius: 8,
+              }}
+            >
+              <VoiceWaveform stream={null} active />
+            </div>
+          ) : (
+            <textarea
+              ref={inputRef}
+              rows={3}
+              dir="auto"
+              value={input}
+              disabled={busy || improving || preparingAttachment}
+              onChange={onInputChange}
+              onKeyDown={onKeyDown}
+              onPaste={onPasteInput}
+              placeholder={projectDir ? t("inputPlaceholder") : t("noProjectHint")}
+              style={{ flex: 1, resize: "none" }}
+            />
+          )}
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
             <button
               className={recording || micConnecting ? "danger" : "ghost"}
@@ -1347,7 +1903,6 @@ export default function ChatPanel({
             </span>
           )}
           <span>{model}</span>
-          <span>{sanitizeEffort(active.reasoningEffort)}</span>
           {active.autoApprove && <span style={{ color: "var(--amber)" }}>{t("autoApproveOn")}</span>}
         </div>
       </div>
@@ -1365,13 +1920,13 @@ export default function ChatPanel({
         <SettingsModal
           settings={{
             systemPrompt: active.systemPrompt,
-            reasoningEffort: sanitizeEffort(active.reasoningEffort),
-            temperature: active.temperature,
             autoApprove: active.autoApprove,
             contextBudget: active.contextBudget || 200_000,
           }}
           onClose={() => setShowSettings(false)}
           onSave={(s: SessionSettings) => updateActive(s)}
+          lowPowerMode={lowPowerMode}
+          onLowPowerModeChange={onLowPowerModeChange}
         />
       )}
       {showPromptLab && (
@@ -1381,6 +1936,45 @@ export default function ChatPanel({
           onClose={() => setShowPromptLab(false)}
           onInsert={(text) => setInput(text)}
         />
+      )}
+      {libraryOpen && activeProject && (
+        <LibraryModal
+          projectId={activeProject.id}
+          workspace={activeProject.directory}
+          onClose={() => setLibraryOpen(false)}
+          onChanged={(items) => setSkills([...items])}
+        />
+      )}
+      {showProjectSettings && activeProject && (
+        <ProjectSettingsModal
+          project={activeProject}
+          onSave={(updated) => setProjects((cur) => cur.map((p) => (p.id === updated.id ? updated : p)))}
+          onClose={() => setShowProjectSettings(false)}
+        />
+      )}
+      {showRoutingConfirm && (
+        <div className="modal-overlay" onClick={() => setShowRoutingConfirm(false)}>
+          <div className="modal" dir={uiDir()} style={{ width: 420 }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0 }}>{t("routingConfirmTitle")}</h3>
+            <div style={{ fontSize: 12.5, opacity: 0.8, marginBottom: 14, lineHeight: 1.7 }}>
+              {t("routingConfirmBody")}
+            </div>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, marginBottom: 16 }}>
+              <input
+                type="checkbox"
+                checked={routingConfirmKeep}
+                onChange={(e) => setRoutingConfirmKeep(e.target.checked)}
+              />
+              {t("routingConfirmKeepLabel")}
+            </label>
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+              <button onClick={() => setShowRoutingConfirm(false)}>{t("cancel")}</button>
+              <button className="primary" onClick={confirmRoutingAndSend}>
+                {t("routingConfirmContinue")}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
